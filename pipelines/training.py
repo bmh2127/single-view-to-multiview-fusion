@@ -75,12 +75,6 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
         help="Learning rate for model training.",
         default=0.001,
     )
-
-    patch_size = Parameter(
-        "patch-size",
-        help="Size of 3D patches for training (z,y,x)",
-        default="64,128,128",
-    )
     
     use_physics = Parameter(
         "use-physics",
@@ -93,10 +87,6 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
         help="Minimum normalized SSIM threshold required to register the model.",
         default=0.7,
     )
-
-    def get_patch_size(self):
-        """Convert patch size parameter to tuple."""
-        return tuple(map(int, self.patch_size.split(',')))
 
     @card
     @step
@@ -111,16 +101,9 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
         logging.info("Running flow in %s mode.", self.mode)
 
         # Load dataset
-        dataset_files = self.load_dataset()
-        logging.info("Loaded dataset with %d single-view files and %d fused-view files",
-                    len(dataset_files["single_view"]), len(dataset_files["fused_view"]))
-        
-        # Create train/val splits
-        self.dataset_splits = self.prepare_dataset_splits(
-            dataset_files["single_view"],
-            dataset_files["fused_view"],
-            train_ratio=0.8
-        )
+        data_loaders = self.load_dataset()
+        self.train_loader = data_loaders['train']
+        self.val_loader = data_loaders['val']
         
         try:
             # Start a new MLflow run
@@ -139,98 +122,6 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
         except Exception as e:
             message = f"Failed to connect to MLflow server {self.mlflow_tracking_uri}."
             raise RuntimeError(message) from e
-        
-        # Continue to data preparation
-        self.next(self.prepare_data)
-    
-    @card
-    @step
-    def prepare_data(self):
-        """Prepare and preprocess the data for training."""
-        import torch
-        from torch.utils.data import Dataset, DataLoader
-        
-        class LightSheetDataset(Dataset):
-            def __init__(self, single_view_files, fused_view_files, patch_size):
-                self.single_view_files = single_view_files
-                self.fused_view_files = fused_view_files
-                self.patch_size = patch_size
-            
-            def __len__(self):
-                return len(self.single_view_files)
-            
-            def __getitem__(self, idx):
-                # Load files
-                sv_path = self.single_view_files[idx]
-                fv_path = self.fused_view_files[idx]
-                
-                # Load images
-                single_view = load_image(sv_path)
-                fused_view = load_image(fv_path)
-                
-                # Apply normalization
-                single_view = percentile_normalization(single_view)
-                fused_view = percentile_normalization(fused_view)
-                
-                # Extract a random patch if the images are larger than patch_size
-                z, y, x = single_view.shape
-                pz, py, px = self.patch_size
-                
-                if z > pz and y > py and x > px:
-                    # Random starting coordinates
-                    start_z = np.random.randint(0, z - pz)
-                    start_y = np.random.randint(0, y - py)
-                    start_x = np.random.randint(0, x - px)
-                    
-                    # Extract patches
-                    single_view = single_view[start_z:start_z+pz, start_y:start_y+py, start_x:start_x+px]
-                    fused_view = fused_view[start_z:start_z+pz, start_y:start_y+py, start_x:start_x+px]
-                
-                # Convert to torch tensors and add channel dimension
-                single_view = torch.from_numpy(single_view).float().unsqueeze(0)
-                fused_view = torch.from_numpy(fused_view).float().unsqueeze(0)
-                
-                return {
-                    'input': single_view,
-                    'target': fused_view,
-                    'file_path': str(sv_path)
-                }
-        
-        # Get patch size and create datasets
-        patch_size = self.get_patch_size()
-        logging.info("Using patch size: %s", patch_size)
-        
-        self.train_dataset = LightSheetDataset(
-            self.dataset_splits['train']['single_view'],
-            self.dataset_splits['train']['fused_view'],
-            patch_size
-        )
-        
-        self.val_dataset = LightSheetDataset(
-            self.dataset_splits['val']['single_view'],
-            self.dataset_splits['val']['fused_view'],
-            patch_size
-        )
-        
-        # Create data loaders
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=self.training_batch_size,
-            shuffle=True,
-            num_workers=2,
-            pin_memory=True
-        )
-        
-        self.val_loader = DataLoader(
-            self.val_dataset,
-            batch_size=self.training_batch_size,
-            shuffle=False,
-            num_workers=2,
-            pin_memory=True
-        )
-        
-        logging.info("Created data loaders with %d training batches and %d validation batches",
-                    len(self.train_loader), len(self.val_loader))
         
         # Continue to model creation
         self.next(self.create_model)
@@ -494,7 +385,8 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
         """Register the model in MLflow Model Registry."""
         import mlflow
         import torch
-        import joblib
+        import shutil
+        from pathlib import Path
 
         mlflow.set_tracking_uri(self.mlflow_tracking_uri)
         
@@ -503,26 +395,52 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
             self.registered = True
             logging.info("Registering model with average N-SSIM: %.4f", self.average_n_ssim)
             
-            # We'll use the approach you suggested for model registration
+            # Follow the approach suggested for model registration
             with (
                 mlflow.start_run(run_id=self.mlflow_run_id),
                 tempfile.TemporaryDirectory() as directory,
             ):
+                # Prepare artifacts
                 self.artifacts = self._get_model_artifacts(directory)
                 self.pip_requirements = self._get_model_pip_requirements()
 
                 # Create inference code paths
                 root = Path(__file__).parent
+                
+                # Define paths to existing files
+                model_py_path = root / "model.py"
+                backend_py_path = root / "backend.py"
+                unet3d_py_path = root / "src" / "models" / "unet3d.py"
+                
+                # Create the inference directory structure
                 inference_dir = root / "inference"
                 inference_dir.mkdir(exist_ok=True)
                 
-                # Create backend file for inference
-                self._create_inference_backend(inference_dir)
-                self.code_paths = [(inference_dir / "backend.py").as_posix()]
+                # Copy the existing files
+                shutil.copy(model_py_path, inference_dir / "model.py")
+                
+                if backend_py_path.exists():
+                    shutil.copy(backend_py_path, inference_dir / "backend.py")
+                else:
+                    # If backend.py doesn't exist, create it
+                    self._create_backend_file(inference_dir / "backend.py")
+                
+                if unet3d_py_path.exists():
+                    shutil.copy(unet3d_py_path, inference_dir / "unet3d.py")
+                else:
+                    # If unet3d.py doesn't exist, create it
+                    self._create_unet3d_file(inference_dir / "unet3d.py")
+                
+                # Define code paths for MLflow
+                self.code_paths = [
+                    (inference_dir / "model.py").as_posix(),
+                    (inference_dir / "unet3d.py").as_posix(),
+                    (inference_dir / "backend.py").as_posix()
+                ]
 
                 # Register the model with MLflow
-                mlflow.pytorch.log_model(
-                    pytorch_model=self.model,
+                mlflow.pyfunc.log_model(
+                    python_model=inference_dir / "model.py",
                     artifact_path="fusemycell-model",
                     registered_model_name="fusemycell-singleview-to-multiview",
                     code_paths=self.code_paths,
@@ -541,6 +459,62 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
         
         # Proceed to end
         self.next(self.end)
+
+    def _get_model_artifacts(self, directory):
+        """Return the list of artifacts that will be included with model.
+
+        The model must preprocess the raw input data before making a prediction, so we
+        need to include any required preprocessing components as artifacts.
+        """
+        import torch
+        from pathlib import Path
+        
+        # Create a model directory for the artifacts
+        model_dir = Path(directory) / "model_dir"
+        model_dir.mkdir(exist_ok=True)
+        
+        artifacts_dir = model_dir / "artifacts"
+        artifacts_dir.mkdir(exist_ok=True)
+        
+        # Save the PyTorch model inside the artifacts directory
+        model_path = (artifacts_dir / "model.pth").as_posix()
+        torch.save(self.model.state_dict(), model_path)
+        
+        # Create a code directory inside the model directory
+        code_dir = model_dir / "code"
+        code_dir.mkdir(exist_ok=True)
+        
+        # Return the artifacts dictionary
+        return {
+            "model_dir": str(model_dir),
+            "code": str(code_dir)
+        }
+
+    def _get_model_pip_requirements(self):
+        """Return the list of required packages to run the model in production."""
+        from common import packages
+        
+        return [
+            f"{package}=={version}" if version else package
+            for package, version in packages(
+                "torch",
+                "numpy",
+                "tifffile",
+                "scikit-image",
+                "pydantic",
+            ).items()
+        ]
+
+    @step
+    def end(self):
+        """End the pipeline and print summary."""
+        if hasattr(self, 'registered') and self.registered:
+            logging.info("Pipeline completed successfully. Model registered with MLflow.")
+        else:
+            logging.info("Pipeline completed. Model not registered.")
+        
+        logging.info("Check MLflow UI for experiment details: %s", self.mlflow_tracking_uri)
+        logging.info("Run ID: %s", self.mlflow_run_id)
 
 
 if __name__ == "__main__":
