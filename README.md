@@ -1,121 +1,139 @@
-# Single-View to Multiview Fusion (FuseMyCell Project)
+# FuseMyCell Project
 
-A deep learning approach to predict fused 3D multiview light sheet microscopy images from a single view.
+A deep learning approach for predicting fused 3D multiview light sheet microscopy images from a single view.
 
 ## Project Overview
 
-This project addresses the challenge of predicting fused 3D images using only one 3D view in light sheet microscopy, providing a solution to reduce photobleaching and phototoxicity while maintaining high-quality imaging.
+This project addresses the challenge posed by France-BioImaging's "Fuse My Cells" challenge at ISBI 2025: predicting a fused 3D microscopy image from a single view. The goal is to enhance image quality and resolution while reducing photobleaching and phototoxicity in light sheet microscopy.
 
-Inspired by the France-BioImaging's "Fuse My Cells" challenge at ISBI 2025.
+## Key Features
+
+- 3D U-Net architecture for single-view to multiview fusion
+- Physics-informed neural network option for enhanced accuracy
+- MLflow integration for experiment tracking and model management
+- Metaflow for workflow orchestration
+- Implementation of the challenge evaluation metrics (N_SSIM)
 
 ## Repository Structure
 
 ```
-single-view-to-multiview-fusion/
+fusemycell/
 ├── data/
 │   ├── raw/                  # Original multiview datasets
-│   ├── processed/            # Preprocessed and aligned data
-│   └── README.md             # Data documentation and sources
+│   └── processed/            # Preprocessed and aligned data
 ├── models/
-│   ├── baseline/             # Baseline model implementation
-│   ├── advanced/             # Advanced architecture implementations
 │   └── checkpoints/          # Saved model weights
-├── notebooks/
-│   ├── 01_data_exploration.ipynb     # Initial data analysis
-│   ├── 02_baseline_results.ipynb     # Baseline model evaluation
-│   └── 03_advanced_model.ipynb       # Advanced model development
-├── src/
-│   ├── data/
-│   │   ├── __init__.py
-│   │   ├── preprocessing.py  # Data preprocessing functions
-│   │   └── dataset.py        # PyTorch dataset classes
-│   ├── models/
-│   │   ├── __init__.py
-│   │   ├── unet3d.py         # 3D U-Net implementation
-│   │   ├── transformer.py    # Transformer-based architecture
-│   │   └── physics.py        # Physics-informed components
-│   ├── training/
-│   │   ├── __init__.py
-│   │   ├── train.py          # Training loops
-│   │   └── evaluate.py       # Evaluation functions
-│   └── utils/
-│       ├── __init__.py
-│       ├── visualization.py  # Visualization utilities
-│       └── metrics.py        # Performance metrics
-├── experiments/
-│   ├── config/               # Configuration files
-│   └── logs/                 # Training logs and MLflow data
-├── results/
-│   ├── figures/              # Generated figures
-│   └── predictions/          # Model predictions
-├── scripts/
-│   ├── download_data.sh      # Data download script
-│   ├── preprocess.py         # Data preprocessing script
-│   └── train_model.py        # Model training script
-├── tests/                    # Unit tests
-├── .gitignore                # Git ignore file
-├── environment.yml           # Conda environment file
-├── requirements.txt          # Python dependencies
-├── setup.py                  # Package setup file
-└── README.md                 # Main project documentation
+├── mlruns/                   # MLflow run data
+├── artifacts/                # MLflow artifacts
+├── common.py                 # Common utilities for the project
+├── training.py               # Metaflow training pipeline
+├── start_mlflow.sh           # Script to start MLflow server
+└── README.md                 # Project documentation
 ```
 
 ## Installation
 
-```bash
-# Clone the repository
-git clone https://github.com/yourusername/single-view-to-multiview-fusion.git
-cd single-view-to-multiview-fusion
+### Prerequisites
 
-# Create and activate conda environment
-conda env create -f environment.yml
-conda activate fusion-env
+- Python 3.12.8
+- CUDA-compatible GPU (recommended)
 
-# Install the package in development mode
-pip install -e .
-```
+### Setup
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/yourusername/fusemycell.git
+   cd fusemycell
+   ```
+
+2. Set up a conda environment:
+   ```bash
+   conda create -n fusemycell python=3.12.8
+   conda activate fusemycell
+   ```
+
+3. Install dependencies:
+   ```bash
+   pip install metaflow mlflow torch tifffile scikit-image cellpose matplotlib pandas numpy
+   ```
 
 ## Usage
 
-### Data Preparation
+### Starting the MLflow Server
+
+Before running any experiments, start the MLflow tracking server:
 
 ```bash
-# Download sample dataset
-bash scripts/download_data.sh
-
-# Preprocess the data
-python scripts/preprocess.py --input data/raw --output data/processed
+chmod +x start_mlflow.sh
+./start_mlflow.sh 5000
 ```
 
-### Training
+This will start the MLflow UI at http://127.0.0.1:5000
+
+### Downloading and Preparing Data
+
+Download the light sheet microscopy datasets using the provided URLs:
 
 ```bash
-# Train baseline model
-python scripts/train_model.py --config experiments/config/baseline.yml
+# Create data directories
+mkdir -p data/raw
 
-# Train advanced model
-python scripts/train_model.py --config experiments/config/advanced.yml
+# Download data (replace with your data download script)
+python download_biostudies.py --output-dir data/raw
 ```
 
-### Evaluation
+### Running the Training Pipeline
 
 ```bash
-# Evaluate model and generate predictions
-python scripts/evaluate.py --model-path models/checkpoints/best_model.pth --data-path data/processed/test
+# Basic training
+python -m training run
+
+# With custom parameters
+python -m training run \
+  --dataset-dir data/raw \
+  --training-epochs 100 \
+  --learning-rate 0.0005 \
+  --patch-size 64,128,128 \
+  --use-physics True
 ```
 
-## Results
+### Viewing Results
 
-[Include visualization examples and performance metrics here]
+Open the MLflow UI in your browser at http://127.0.0.1:5000 to view experiment results, compare runs, and download trained models.
 
-## Approach and Methodology
+## Evaluation Metrics
 
-This project explores several approaches to the single-view to multiview fusion problem:
+This project implements the evaluation metrics specified in the FuseMyCell challenge:
 
-1. **Baseline**: 3D U-Net architecture with skip connections
-2. **Advanced**: 
-   - View-Synthesis Transformer Architecture
-   - Physics-Informed Neural Network
-   - Multi-Stage Pipeline with Uncertainty Estimation
+1. **N_SSIM (Normalized Structural Similarity Index)**: Measures the improvement in structural similarity between the predicted fusion and the ground truth, compared to the input single view.
 
-[Include more details about architecture, training strategy, etc.]
+The normalization is computed as:
+```
+N_SSIM = (prediction_ssim - reference_ssim) / (1 - reference_ssim)
+```
+
+Where:
+- `prediction_ssim` is the SSIM between the predicted fusion and the ground truth
+- `reference_ssim` is the SSIM between the input single view and the ground truth
+
+## Model Architecture
+
+The core model is a 3D U-Net with the following specifications:
+
+- Input: Single-view 3D volume (1 channel)
+- Output: Fused 3D volume (1 channel)
+- Architecture: Encoder-decoder with skip connections
+- Optional physics-informed constraints
+
+## Future Work
+
+- Implement N_IOU metrics with Cellpose segmentation
+- Add multi-view training option (using 2+ views as input)
+- Explore Transformer-based architectures for better long-range dependencies
+- Optimize inference speed for real-time applications
+
+## Acknowledgments
+
+- France-BioImaging for the challenge concept and dataset
+- The EBI BioStudies repository for providing the data
+- The open-source community for tools like PyTorch, MLflow and Metaflow
