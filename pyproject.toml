@@ -1,0 +1,68 @@
+[project]
+name = "single-view-to-multiview-fusion"
+version = "0.1.0"
+description = "3D image fusion model for light sheet microscopy data"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.34.0",
+    "cellpose>=2.2.0",
+    "evidently>=0.5.0",
+    "matplotlib>=3.8.4",
+    "metaflow>=2.13",
+    "metaflow-card-html>=1.0.2",
+    "mlflow[extras]==2.20.2",
+    "numpy>=1.26.4",
+    "pandas>=2.2.3",
+    "pydantic>=2.8.0",
+    "pytest>=8.3.4",
+    "requests>=2.31.0",
+    "scikit-image>=0.22.0",
+    "scikit-learn>=1.6.1",
+    "tifffile>=2024.2.12",
+    "torch>=2.3.0",
+    "tqdm>=4.66.4",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["pipelines"]
+
+[tool.ruff]
+line-length = 88
+indent-width = 4
+target-version = "py310"
+extend-include = ["*.ipynb"]
+extend-select = ["I"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["ANN001", "ANN101", "ANN201", "ANN202", "B006", "BLE001", "E402", "PD901", "PLR0913", "S101", "S311", "T201"]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]
+"**/tests/*.py" = ["D103"]
+
+[tool.pyright]
+venvPath = "./../."
+venv = ".venv"
+typeCheckingMode = "off"
+
+[tool.pyright.diagnosticSeverityOverrides]
+reportCallIssue = "off"
+
+[tool.pytest.ini_options]
+pythonpath="pipelines"
+addopts="--maxfail=2 -rf -W ignore::DeprecationWarning"
+markers = [
+    "integration: marks integration tests (deselect with '-m \"not integration\"')"
+]
