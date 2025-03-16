@@ -20,10 +20,10 @@ PACKAGES = {
     "scikit-learn": "1.6.1",
     "mlflow": "2.20.2",
     "tensorflow": "2.17.0",
-    "torch": "2.3.0",
+    "torch": "",
     "tifffile": "2024.2.12",
     "scikit-image": "0.22.0",
-    "cellpose": "2.2.4",
+    "cellpose": "",
 }
 
 

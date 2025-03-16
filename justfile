@@ -45,17 +45,23 @@ test:
         --environment conda \
         --dataset-dir {{DATASET_DIR}} \
         --training-epochs 50 \
+        --training-batch-size 4 \
+        --learning-rate 0.001 \
+        --n-ssim-threshold 0.7 \
         run
 
 # Run training pipeline with specific parameters
 [group('training')]
-@train-custom epochs="50" batch_size="4" lr="0.001":
+@train-custom epochs="50" batch_size="4" lr="0.001" studies="" patch="64,128,128" physics="false":
     uv run -- python pipelines/training.py \
         --environment conda \
         --dataset-dir {{DATASET_DIR}} \
         --training-epochs {{epochs}} \
         --training-batch-size {{batch_size}} \
         --learning-rate {{lr}} \
+        --study-ids {{studies}} \
+        --patch-size {{patch}} \
+        --use-physics {{physics}} \
         run
 
 # Run training pipeline card server 

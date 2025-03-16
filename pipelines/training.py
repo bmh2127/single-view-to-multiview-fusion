@@ -11,7 +11,6 @@ from common import (
     percentile_normalization,
     compute_n_ssim,
     configure_logging,
-    packages,
     load_image,
 )
 from metaflow import (
@@ -31,19 +30,20 @@ configure_logging()
 
 @project(name="fusemycell")
 @conda_base(
-    python=PYTHON,
-    packages=packages(
-        "pandas",
-        "numpy",
-        "mlflow",
-        "torch",
-        "tifffile",
-        "scikit-image",
-        "cellpose",
-        "matplotlib",
-        "boto3",
-        "metaflow",
-    ),
+    python="3.12",
+    libraries={
+        "pytorch::pytorch": "",  # Latest version
+        "pytorch::torchvision": "",  # Latest version
+        "conda-forge::pandas": "",
+        "conda-forge::numpy": "",
+        "conda-forge::mlflow": "2.20.2",
+        "conda-forge::tifffile": "2024.2.12",
+        "conda-forge::scikit-image": "0.22.0",
+        "conda-forge::matplotlib": "",
+        "conda-forge::boto3": "",
+        "conda-forge::metaflow": "",
+        "conda-forge::cellpose": "", 
+    }
 )
 class FuseMyCellTraining(FlowSpec, DatasetMixin):
     """FuseMyCell Training Pipeline.
@@ -492,17 +492,13 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
 
     def _get_model_pip_requirements(self):
         """Return the list of required packages to run the model in production."""
-        from common import packages
-        
+        # Define the required packages with versions
         return [
-            f"{package}=={version}" if version else package
-            for package, version in packages(
-                "torch",
-                "numpy",
-                "tifffile",
-                "scikit-image",
-                "pydantic",
-            ).items()
+            "torch>=2.0.0",
+            "numpy>=1.20.0",
+            "tifffile>=2024.2.12",
+            "scikit-image>=0.22.0",
+            "pydantic>=2.0.0",
         ]
 
     @step
