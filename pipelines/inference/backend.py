@@ -15,8 +15,62 @@ import numpy as np
 import pandas as pd
 import torch
 import tifffile
+from metaflow import Config, Parameter
 
+class BackendMixin:
+    """A mixin for managing the backend implementation of a model.
 
+    This mixin is designed to be combined with any pipeline that requires accessing
+    a hosted model. The mixin provides a common interface for interacting with the
+    model and its associated database.
+    """
+
+    backend_config = Config(
+        "backend-config",
+        help=("Backend configuration used to initialize the provided backend class."),
+    )
+
+    backend = Parameter(
+        "backend",
+        help="Name of the class implementing the `backend.Backend` abstract class.",
+        default="backend.Local",
+    )
+
+    def load_backend(self):
+        """Instantiate the backend class using the supplied configuration."""
+        try:
+            module, cls = self.backend.rsplit(".", 1)
+            module = importlib.import_module(module)
+            backend_impl = getattr(module, cls)(config=self._get_config())
+        except Exception as e:
+            message = f"There was an error instantiating class {self.backend}."
+            raise RuntimeError(message) from e
+        else:
+            logging.info("Backend: %s", self.backend)
+            return backend_impl
+
+    def _get_config(self):
+        """Return the backend configuration with environment variables expanded.
+
+        This function supports using ${ENVIRONMENT_VARIABLE} syntax as part of the
+        configuration values.
+        """
+        if not self.backend_config:
+            return None
+
+        config = self.backend_config.to_dict()
+        pattern = re.compile(r"\$\{(\w+)\}")
+
+        def replacer(match):
+            env_var = match.group(1)
+            return os.getenv(env_var, f"${{{env_var}}}")
+
+        for key, value in self.backend_config.items():
+            if isinstance(value, str):
+                config[key] = pattern.sub(replacer, value)
+
+        return config
+    
 def percentile_normalization(image, pmin=2, pmax=99.8, axis=None):
     """
     Compute a percentile normalization for the given image.
@@ -678,105 +732,649 @@ class JsonLines(Backend):
             "Use 'mlflow models serve' to serve the model."
         )
 
+class Sagemaker(Backend):
+    """Sagemaker backend implementation.
 
-class _FuseMyCellWrapper:
+    A model with this backend will be deployed to Sagemaker and will use S3
+    to store production data.
     """
-    A wrapper class that loads artifacts and implements prediction logic for the FuseMyCell model.
-    This class is used by MLflow's pyfunc model flavor.
-    """
-    
-    def __init__(self, model_path):
-        """
-        Load model and artifacts from the given path.
-        
-        Args:
-            model_path: Path to the directory containing model artifacts
-        """
-        import torch
-        import importlib.util
-        from pathlib import Path
-        
-        logging.info(f"Loading FuseMyCell model from {model_path}")
-        self.model_path = model_path
-        
-        # Load model architecture
-        model_file = Path(model_path) / "model.pth"
-        artifacts_dir = Path(model_path) / "artifacts"
-        
-        # Import the model definition
-        spec = importlib.util.spec_from_file_location(
-            "unet3d", 
-            Path(model_path) / "code" / "unet3d.py"
+
+    def __init__(self, config: dict | None = None) -> None:
+        """Initialize backend using the supplied configuration."""
+        from mlflow.deployments import get_deploy_client
+
+        self.target = config.get("target", "fusemycell") if config else "fusemycell"
+        self.data_capture_uri = config.get("data-capture-uri", None) if config else None
+        self.ground_truth_uri = config.get("ground-truth-uri", None) if config else None
+
+        # Let's make sure the ground truth uri ends with a '/'
+        self.ground_truth_uri = (
+            self.ground_truth_uri.rstrip("/") + "/" if self.ground_truth_uri else None
         )
-        unet_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(unet_module)
+
+        self.assume_role = config.get("assume-role", None) if config else None
+        self.region = config.get("region", "us-east-1") if config else "us-east-1"
+
+        self.deployment_target_uri = (
+            f"sagemaker:/{self.region}/{self.assume_role}"
+            if self.assume_role
+            else f"sagemaker:/{self.region}"
+        )
+
+        self.deployment_client = get_deploy_client(self.deployment_target_uri)
+
+        # Data directory for storing temporary TIFF files
+        self.temp_dir = tempfile.mkdtemp(prefix="sagemaker_fusemycell_")
         
-        # Determine device (CPU or GPU)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logging.info(f"Using device: {self.device}")
-        
-        # Create model instance
-        self.model = unet_module.UNet3D(in_channels=1, out_channels=1, init_features=64)
-        
-        # Load model weights
-        self.model.load_state_dict(torch.load(
-            artifacts_dir / "model.pth", 
-            map_location=self.device
-        ))
-        self.model = self.model.to(self.device)
-        self.model.eval()
-        
-        logging.info("FuseMyCell model loaded successfully")
+        logging.info("Target: %s", self.target)
+        logging.info("Data capture URI: %s", self.data_capture_uri)
+        logging.info("Ground truth URI: %s", self.ground_truth_uri)
+        logging.info("Assume role: %s", self.assume_role)
+        logging.info("Region: %s", self.region)
+        logging.info("Deployment target URI: %s", self.deployment_target_uri)
+        logging.info("Temporary directory: %s", self.temp_dir)
+
+    def load(self, limit: int = 100) -> pd.DataFrame:
+        """Load production data from an S3 bucket."""
+        import boto3
+
+        s3 = boto3.client("s3")
+        data = self._load_collected_data(s3)
+
+        if data.empty:
+            return data
+
+        # We want to return samples that have a ground truth label.
+        data = data[data["ground_truth_path"].notna()]
+
+        # We need to remove a few columns that are not needed for the monitoring tests
+        # and return `limit` number of samples.
+        if "date" in data.columns:
+            data = data.drop(columns=["date"])
+        if "event_id" in data.columns:
+            data = data.drop(columns=["event_id"])
+
+        # We want to return `limit` number of samples.
+        return data.head(limit)
+
+    def label(self, ground_truth_quality=0.8):
+        """Label every unlabeled sample stored in S3.
+
+        This function loads any unlabeled data from the location where Sagemaker stores
+        the data captured by the endpoint and generates fake ground truth labels.
+        """
+        import json
+        from datetime import datetime, timezone
+
+        import boto3
+
+        if self.ground_truth_uri is None:
+            logging.error("Ground truth URI is not defined.")
+            return 0
+
+        s3 = boto3.client("s3")
+        data = self._load_unlabeled_data(s3)
+
+        logging.info("Loaded %s unlabeled samples from S3.", len(data))
+
+        # If there are no unlabeled samples, we don't need to do anything else.
+        if data.empty:
+            return 0
+
+        records = []
+        for event_id, group in data.groupby("event_id"):
+            # Generate synthetic ground truth for each sample
+            for _, row in group.iterrows():
+                output_path = row.get("output_path")
+                
+                if not output_path:
+                    continue
+                
+                try:
+                    # Download the output file locally
+                    local_output_path = os.path.join(self.temp_dir, f"{event_id}_output.tif")
+                    output_bucket, output_key = self._parse_s3_uri(output_path)
+                    s3.download_file(output_bucket, output_key, local_output_path)
+                    
+                    # Load the prediction
+                    prediction = tifffile.imread(local_output_path)
+                    
+                    # Generate synthetic ground truth
+                    ground_truth = self.get_fake_label(prediction, ground_truth_quality)
+                    
+                    # Save the synthetic ground truth
+                    local_gt_path = os.path.join(self.temp_dir, f"{event_id}_ground_truth.tif")
+                    tifffile.imwrite(local_gt_path, ground_truth)
+                    
+                    # Upload to S3
+                    gt_bucket = self.ground_truth_uri.split("/")[2]
+                    upload_time = datetime.now(tz=timezone.utc)
+                    gt_key = f"ground_truth/{event_id}/{upload_time:%Y/%m/%d/%H/%M%S}.tif"
+                    s3.upload_file(local_gt_path, gt_bucket, gt_key)
+                    
+                    # Create record for the ground truth data
+                    record = {
+                        "groundTruthData": {
+                            "path": f"s3://{gt_bucket}/{gt_key}",
+                            "format": "TIFF",
+                        },
+                        "eventMetadata": {
+                            "eventId": event_id,
+                        },
+                        "eventVersion": "0",
+                    }
+                    
+                    records.append(json.dumps(record))
+                except Exception as e:
+                    logging.exception(f"Error generating ground truth for event {event_id}: {e}")
+
+        # If we have records, upload them to S3
+        if records:
+            ground_truth_payload = "\n".join(records)
+            upload_time = datetime.now(tz=timezone.utc)
+            uri = (
+                "/".join(self.ground_truth_uri.split("/")[3:])
+                + f"{upload_time:%Y/%m/%d/%H/%M%S}.jsonl"
+            )
+
+            s3.put_object(
+                Body=ground_truth_payload,
+                Bucket=self.ground_truth_uri.split("/")[2],
+                Key=uri,
+            )
+
+        return len(data)
     
-    def predict(self, context, model_input):
+    def invoke(self, payload: list | dict) -> dict | None:
+        """Make a prediction request to the Sagemaker endpoint."""
+        logging.info('Running prediction on "%s"...', self.target)
+
+        response = self.deployment_client.predict(
+            self.target,
+            json.dumps(
+                {
+                    "inputs": payload,
+                },
+            ),
+        )
+        
+        # For FuseMyCell, the response structure will be different from penguin classifier
+        # We return the full JSON response 
+        logging.info("Received prediction response from endpoint")
+        
+        return response
+        
+    def deploy(self, model_uri: str, model_version: str) -> None:
+        """Deploy the model to Sagemaker.
+
+        This function creates a new Sagemaker Model, Sagemaker Endpoint Configuration,
+        and Sagemaker Endpoint to serve the latest version of the model.
+
+        If the endpoint already exists, this function will update it with the latest
+        version of the model.
         """
-        Generate fused view predictions from single view inputs.
-        
-        Args:
-            context: MLflow model context
-            model_input: Dictionary containing the input data
-                {'single_view': numpy array or path to TIFF file}
-                
-        Returns:
-            Dictionary containing the prediction results
-        """
-        # Process input (which could be a file path or numpy array)
-        if isinstance(model_input, dict) and 'single_view' in model_input:
-            input_data = model_input['single_view']
-        else:
-            input_data = model_input
-            
-        # Handle different input types
-        if isinstance(input_data, str):
-            # Input is a file path
-            logging.info(f"Loading input from file: {input_data}")
-            try:
-                single_view = tifffile.imread(input_data)
-                
-                # Handle different dimensions
-                if len(single_view.shape) == 2:  # Single 2D image
-                    single_view = single_view[np.newaxis, ...]
-                elif len(single_view.shape) == 4:  # Multiple channels
-                    # For simplicity, just take the first channel
-                    single_view = single_view[..., 0]
-                
-            except Exception as e:
-                raise ValueError(f"Error loading input file: {str(e)}")
-        elif isinstance(input_data, np.ndarray):
-            # Input is a numpy array
-            single_view = input_data
-        else:
-            raise ValueError(f"Unsupported input type: {type(input_data)}")
-        
-        # Generate prediction
-        fused_view = predict_fused_view(self.model, single_view)
-        
-        # Save prediction to a temporary file if needed
-        with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
-            output_path = tmp.name
-            tifffile.imwrite(output_path, fused_view)
-        
-        return {
-            'fused_view': fused_view,
-            'output_path': output_path
+        from mlflow.exceptions import MlflowException
+
+        deployment_configuration = {
+            "instance_type": "ml.m4.xlarge",
+            "instance_count": 1,
+            "synchronous": True,
+            # We want to archive resources associated with the endpoint that become
+            # inactive as the result of updating an existing deployment.
+            "archive": True,
+            # Notice how we are storing the version number as a tag.
+            "tags": {"version": model_version},
         }
+
+        # If the data capture destination is defined, we can configure the Sagemaker
+        # endpoint to capture data.
+        if self.data_capture_uri is not None:
+            deployment_configuration["data_capture_config"] = {
+                "EnableCapture": True,
+                "InitialSamplingPercentage": 100,
+                "DestinationS3Uri": self.data_capture_uri,
+                "CaptureOptions": [
+                    {"CaptureMode": "Input"},
+                    {"CaptureMode": "Output"},
+                ],
+                "CaptureContentTypeHeader": {
+                    "CsvContentTypes": ["text/csv", "application/octect-stream"],
+                    "JsonContentTypes": [
+                        "application/json",
+                        "application/octect-stream",
+                    ],
+                },
+            }
+
+        if self.assume_role:
+            deployment_configuration["execution_role_arn"] = self.assume_role
+
+        try:
+            # Let's return the deployment with the name of the endpoint we want to
+            # create. If the endpoint doesn't exist, this function will raise an
+            # exception.
+            deployment = self.deployment_client.get_deployment(self.target)
+
+            # We now need to check whether the model we want to deploy is already
+            # associated with the endpoint.
+            if self._is_sagemaker_model_running(deployment, model_version):
+                logging.info(
+                    'Endpoint "%s" is already running model "%s".',
+                    self.target,
+                    model_version,
+                )
+            else:
+                # If the model we want to deploy is not associated with the endpoint,
+                # we need to update the current deployment to replace the previous model
+                # with the new one.
+                self._update_sagemaker_deployment(
+                    deployment_configuration,
+                    model_uri,
+                    model_version,
+                )
+        except MlflowException:
+            # If the endpoint doesn't exist, we can create a new deployment.
+            self._create_sagemaker_deployment(
+                deployment_configuration,
+                model_uri,
+                model_version,
+            )
+            
+    def _get_boto3_client(self, service):
+        """Return a boto3 client for the specified service.
+
+        If the `assume_role` parameter is provided, this function will assume the role
+        and return a new client with temporary credentials.
+        """
+        import boto3
+
+        if not self.assume_role:
+            return boto3.client(service)
+
+        # If we have to assume a role, we need to create a new
+        # Security Token Service (STS)
+        sts_client = boto3.client("sts")
+
+        # Let's use the STS client to assume the role and return
+        # temporary credentials
+        credentials = sts_client.assume_role(
+            RoleArn=self.assume_role,
+            RoleSessionName="fusemycell-session",
+        )["Credentials"]
+
+        # We can use the temporary credentials to create a new session
+        # from where to create the client for the target service.
+        session = boto3.Session(
+            aws_access_key_id=credentials["AccessKeyId"],
+            aws_secret_access_key=credentials["SecretAccessKey"],
+            aws_session_token=credentials["SessionToken"],
+        )
+
+        return session.client(service)
+        
+    def _is_sagemaker_model_running(self, deployment, version):
+        """Check if the model is already running in Sagemaker.
+
+        This function will check if the current model is already associated with a
+        running Sagemaker endpoint.
+        """
+        sagemaker_client = self._get_boto3_client(service="sagemaker")
+
+        # Here, we're assuming there's only one production variant associated with
+        # the endpoint. This code will need to be updated if an endpoint could have
+        # multiple variants.
+        variant = deployment.get("ProductionVariants", [])[0]
+
+        # From the variant, we can get the ARN of the model associated with the
+        # endpoint.
+        model_arn = sagemaker_client.describe_model(
+            ModelName=variant.get("VariantName"),
+        ).get("ModelArn")
+
+        # With the model ARN, we can get the tags associated with the model.
+        tags = sagemaker_client.list_tags(ResourceArn=model_arn).get("Tags", [])
+
+        # Finally, we can check whether the model has a `version` tag that matches
+        # the model version we're trying to deploy.
+        model = next(
+            (
+                tag["Value"]
+                for tag in tags
+                if (tag["Key"] == "version" and tag["Value"] == version)
+            ),
+            None,
+        )
+
+        return model is not None
+        
+    def _create_sagemaker_deployment(
+        self,
+        deployment_configuration,
+        model_uri,
+        model_version,
+    ):
+        """Create a new Sagemaker deployment using the supplied configuration."""
+        logging.info(
+            'Creating endpoint "%s" with model "%s"...',
+            self.target,
+            model_version,
+        )
+
+        self.deployment_client.create_deployment(
+            name=self.target,
+            model_uri=model_uri,
+            flavor="python_function",
+            config=deployment_configuration,
+        )
+
+    def _update_sagemaker_deployment(
+        self,
+        deployment_configuration,
+        model_uri,
+        model_version,
+    ):
+        """Update an existing Sagemaker deployment using the supplied configuration."""
+        logging.info(
+            'Updating endpoint "%s" with model "%s"...',
+            self.target,
+            model_version,
+        )
+
+        # If you wanted to implement a staged rollout, you could extend the deployment
+        # configuration with a `mode` parameter with the value
+        # `mlflow.sagemaker.DEPLOYMENT_MODE_ADD` to create a new production variant. You
+        # can then route some of the traffic to the new variant using the Sagemaker SDK.
+        self.deployment_client.update_deployment(
+            name=self.target,
+            model_uri=model_uri,
+            flavor="python_function",
+            config=deployment_configuration,
+        )
+        
+    def _parse_s3_uri(self, uri):
+        """Parse an S3 URI into bucket and key components."""
+        if not uri.startswith('s3://'):
+            raise ValueError(f"Invalid S3 URI: {uri}")
+            
+        parts = uri[5:].split('/', 1)
+        if len(parts) != 2:
+            raise ValueError(f"Invalid S3 URI format: {uri}")
+            
+        return parts[0], parts[1]
+        
+    def _load_unlabeled_data(self, s3):
+        """Load any unlabeled data from the specified S3 location.
+
+        This function will load the data captured from the endpoint during inference
+        that does not have a corresponding ground truth information.
+        """
+        data = self._load_collected_data(s3)
+        return data if data.empty else data[data["ground_truth_path"].isna()]
+        
+    def _load_collected_data(self, s3):
+        """Load data from the endpoint and merge it with its ground truth."""
+        data = self._load_collected_data_files(s3)
+        ground_truth = self._load_ground_truth_files(s3)
+
+        if len(data) == 0:
+            return pd.DataFrame()
+
+        if len(ground_truth) > 0:
+            # Merge based on event_id
+            data = data.merge(
+                ground_truth,
+                on=["event_id"],
+                how="left",
+            )
+
+        return data
+        
+    def _load_ground_truth_files(self, s3):
+        """Load the ground truth data from the specified S3 location."""
+        if not self.ground_truth_uri:
+            return pd.DataFrame()
+
+        df = self._load_files(s3, self.ground_truth_uri)
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        processed_data = []
+        for _, row in df.iterrows():
+            try:
+                gt_path = row["groundTruthData"]["path"]
+                event_id = row["eventMetadata"]["eventId"]
+                
+                processed_data.append({
+                    "event_id": event_id,
+                    "ground_truth_path": gt_path
+                })
+            except (KeyError, TypeError) as e:
+                logging.warning(f"Error processing ground truth record: {e}")
+                
+        return pd.DataFrame(processed_data) if processed_data else pd.DataFrame()
+        
+    def _load_collected_data_files(self, s3):
+        """Load the data captured from the endpoint during inference."""
+        if not self.data_capture_uri:
+            return pd.DataFrame()
+            
+        df = self._load_files(s3, self.data_capture_uri)
+        if df is None:
+            return pd.DataFrame()
+
+        processed_data = []
+        for _, row in df.iterrows():
+            try:
+                date = row["eventMetadata"]["inferenceTime"]
+                event_id = row["eventMetadata"]["eventId"]
+                
+                input_data = json.loads(row["captureData"]["endpointInput"]["data"])
+                output_data = json.loads(row["captureData"]["endpointOutput"]["data"])
+                
+                # Extract file paths if available
+                input_path = None
+                output_path = None
+                n_ssim = None
+                
+                if isinstance(input_data, dict) and "file_path" in input_data:
+                    input_path = input_data["file_path"]
+                
+                if isinstance(output_data, dict):
+                    if "output_path" in output_data:
+                        output_path = output_data["output_path"]
+                    if "n_ssim" in output_data:
+                        n_ssim = output_data["n_ssim"]
+                
+                processed_data.append({
+                    "event_id": event_id,
+                    "date": date,
+                    "input_path": input_path,
+                    "output_path": output_path,
+                    "n_ssim": n_ssim
+                })
+            except (KeyError, json.JSONDecodeError) as e:
+                logging.warning(f"Error processing capture data record: {e}")
+        
+        if not processed_data:
+            return pd.DataFrame()
+            
+        result_df = pd.DataFrame(processed_data)
+        return result_df.sort_values(by="date", ascending=False).reset_index(drop=True)
+        
+    def _load_files(self, s3, s3_uri):
+        """Load every file stored in the supplied S3 location.
+
+        This function will recursively return the contents of every file stored under
+        the specified location. The function assumes that the files are stored in JSON
+        Lines format.
+        """
+        if not s3_uri:
+            return None
+            
+        bucket = s3_uri.split("/")[2]
+        prefix = "/".join(s3_uri.split("/")[3:])
+
+        paginator = s3.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+
+        files = [
+            obj["Key"]
+            for page in pages
+            if "Contents" in page
+            for obj in page["Contents"]
+        ]
+
+        if len(files) == 0:
+            return None
+
+        dfs = []
+        for file in files:
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=file)
+                data = obj["Body"].read().decode("utf-8")
+
+                json_lines = data.splitlines()
+
+                # Parse each line as a JSON object and collect into a list
+                records = []
+                for line in json_lines:
+                    if line.strip():  # Skip empty lines
+                        try:
+                            records.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            logging.warning(f"Invalid JSON in file {file}")
+                
+                if records:
+                    dfs.append(pd.DataFrame(records))
+            except Exception as e:
+                logging.warning(f"Error reading file {file}: {e}")
+
+        # Concatenate all DataFrames into a single DataFrame
+        return pd.concat(dfs, ignore_index=True) if dfs else None
+
+class Mock(Backend):
+    """Mock implementation of the Backend abstract class.
+
+    This class is helpful for testing purposes to simulate access to
+    a production backend with 3D image data.
+    """
+
+    def __init__(self, config: dict | None = None) -> None:
+        """Initialize the mock backend."""
+        self.temp_dir = tempfile.mkdtemp(prefix="mock_fusemycell_")
+        logging.info(f"Mock backend initialized with temp directory: {self.temp_dir}")
+        
+        # Create a simple in-memory storage to simulate database
+        self.storage = []
+        
+        # Track ground truth data
+        self.ground_truth = {}
+        
+    def load(self, limit: int = 100) -> pd.DataFrame | None:
+        """Return fake data for testing purposes."""
+        if not self.storage:
+            # Return empty if no data
+            return pd.DataFrame()
+            
+        # Create DataFrame from storage and filter for labeled data
+        df = pd.DataFrame(self.storage)
+        df_labeled = df[df["ground_truth_path"].notna()]
+        
+        # Return most recent entries up to limit
+        return df_labeled.sort_values("prediction_date", ascending=False).head(limit)
+
+    def save(self, model_input: list | dict, model_output: list) -> None:
+        """Mock saving data to storage."""
+        logging.info("Mock backend: Storing production data...")
+        
+        # Ensure model_input is a list
+        if isinstance(model_input, dict):
+            model_input = [model_input]
+            
+        # Current time for all records
+        current_time = datetime.now(timezone.utc).isoformat()
+        
+        for i, (input_data, output_data) in enumerate(zip(model_input, model_output)):
+            record_uuid = str(uuid.uuid4())
+            
+            # Handle input data
+            input_path = input_data.get('file_path')
+            if not input_path and 'data' in input_data and isinstance(input_data['data'], np.ndarray):
+                input_path = os.path.join(self.temp_dir, f"{record_uuid}_input.tif")
+                # Just pretend to save it, don't actually write the file for speed in testing
+                
+            # Handle output data (simulate paths without writing files)
+            output_path = output_data.get('output_path')
+            if not output_path:
+                output_path = os.path.join(self.temp_dir, f"{record_uuid}_output.tif")
+            
+            # Extract N-SSIM if available
+            n_ssim = output_data.get('n_ssim')
+            
+            # Create and store record
+            record = {
+                "uuid": record_uuid,
+                "input_path": input_path,
+                "output_path": output_path,
+                "n_ssim": n_ssim,
+                "ground_truth_path": None,  # Initially unlabeled
+                "prediction_date": current_time
+            }
+            
+            self.storage.append(record)
+            
+        logging.info(f"Mock backend: Saved {len(model_output)} records")
+
+    def label(self, ground_truth_quality: float = 0.8) -> int:
+        """Simulate labeling of unlabeled samples."""
+        unlabeled = [record for record in self.storage if record["ground_truth_path"] is None]
+        logging.info(f"Mock backend: Found {len(unlabeled)} unlabeled samples")
+        
+        if not unlabeled:
+            return 0
+            
+        labeled_count = 0
+        for record in unlabeled:
+            uuid_val = record["uuid"]
+            
+            # Simulate creating ground truth
+            ground_truth_path = os.path.join(self.temp_dir, f"{uuid_val}_ground_truth.tif")
+            record["ground_truth_path"] = ground_truth_path
+            
+            # Remember the quality for this record
+            self.ground_truth[uuid_val] = ground_truth_quality
+            
+            labeled_count += 1
+            
+        logging.info(f"Mock backend: Labeled {labeled_count} samples")
+        return labeled_count
+
+    def invoke(self, payload: list | dict) -> dict | None:
+        """Simulate model prediction."""
+        logging.info("Mock backend: Simulating model prediction...")
+        
+        # Create a generic mock response for any input
+        mock_responses = []
+        
+        # Ensure payload is a list
+        if isinstance(payload, dict):
+            payload = [payload]
+            
+        for item in payload:
+            # Create a fake output path
+            output_path = os.path.join(self.temp_dir, f"{uuid.uuid4()}_prediction.tif")
+            
+            # Generate a random N-SSIM score between 0.5 and 0.9
+            n_ssim = round(0.5 + 0.4 * random.random(), 4)
+            
+            mock_responses.append({
+                "output_path": output_path,
+                "n_ssim": n_ssim
+            })
+        
+        return {"predictions": mock_responses}
+
+    def deploy(self, model_uri: str, model_version: str) -> None:
+        """Mock deployment."""
+        logging.info(f"Mock backend: Simulating deployment of model {model_version} from {model_uri}")
+        # Nothing to actually do for mock
