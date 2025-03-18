@@ -350,7 +350,7 @@ class DatasetMixin:
     dataset_dir = Parameter(
         "dataset-dir",
         help="Directory containing the light sheet microscopy dataset.",
-        default="data/raw",
+        default="data",
     )
 
     study_ids = Parameter(
