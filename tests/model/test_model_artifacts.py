@@ -6,7 +6,7 @@ import torch
 
 import pytest
 
-from model import Model
+from pipelines.inference.model import Model
 
 
 @pytest.fixture

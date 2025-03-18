@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 from common import PYTHON, DatasetMixin, configure_logging, packages, compute_n_ssim, percentile_normalization
-from inference.backend import BackendMixin
+from pipelines.inference.backend import BackendMixin
 from metaflow import (
     FlowSpec,
     Parameter,

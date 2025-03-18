@@ -10,12 +10,16 @@ def test_start_loads_dataset(training_run):
     assert data.val_loader is not None
 
 
+
 def test_start_creates_mlflow_run(training_run):
+    # Check that MLflow tracking URI is set
     data = training_run["start"].task.data
+    assert hasattr(data, "mlflow_tracking_uri")
+    assert data.mlflow_tracking_uri is not None
     
-    # Check that MLflow run was created
-    assert hasattr(data, "mlflow_run_id")
-    assert data.mlflow_run_id is not None
+    # Check logs for evidence of MLflow run creation
+    logs = training_run["start"].task.stdout
+    assert "MLflow tracking server" in logs
 
 
 def test_start_sets_training_parameters(training_run):

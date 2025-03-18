@@ -1,7 +1,6 @@
 from unittest.mock import Mock
 import torch
 import numpy as np
-from model import Model
 import pytest
 from unittest.mock import patch
 

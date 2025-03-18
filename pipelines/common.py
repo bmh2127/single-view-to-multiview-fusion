@@ -12,6 +12,7 @@ import torch
 import tifffile
 from torch.utils.data import Dataset, DataLoader
 from metaflow import IncludeFile, Parameter, current, S3
+from unet3d import UNet3D, PhysicsInformedUNet3D
 
 PYTHON = "3.12.8"
 
@@ -20,10 +21,12 @@ PACKAGES = {
     "scikit-learn": "1.6.1",
     "mlflow": "2.20.2",
     "tensorflow": "2.17.0",
-    "torch": "",
+    "torch": "2.3.1",
+    "torchvision": "0.18.1",
+    "torchaudio": "2.3.1",
     "tifffile": "2024.2.12",
     "scikit-image": "0.22.0",
-    "cellpose": "",
+    "cellpose": "2.2.4",
 }
 
 
@@ -359,7 +362,13 @@ class DatasetMixin:
     patch_size = Parameter(
         "patch-size",
         help="Size of 3D patches for training (z,y,x)",
-        default="64,128,128",
+        default="32,64,64",  # Updated to a more suitable default
+    )
+
+    patch_overlap = Parameter(
+        "patch-overlap",
+        help="Overlap between adjacent patches during inference (z,y,x)",
+        default="8,16,16",  # 25% overlap for each dimension
     )
 
     s3_bucket = Parameter(
@@ -371,6 +380,10 @@ class DatasetMixin:
     def get_patch_size(self):
         """Convert patch size parameter to tuple."""
         return tuple(map(int, self.patch_size.split(',')))
+    
+    def get_patch_overlap(self):
+        """Convert patch overlap parameter to tuple."""
+        return tuple(map(int, self.patch_overlap.split(',')))
 
     def load_dataset(self):
         """Load and prepare the light sheet microscopy dataset."""
@@ -392,21 +405,167 @@ class DatasetMixin:
                 study_ids = None
                 logging.info("Using all available studies")
                 
-            # Create dataset using the helper function
-            data_loaders = prepare_data_loaders(
-                dataset_dir=self.dataset_dir,
-                study_ids=study_ids,
-                batch_size=self.training_batch_size,
-                patch_size=self.get_patch_size(),
-                num_workers=4
-            )
+            # Create dataset using the helper function with updated patch size
+            patch_size = self.get_patch_size()
+            logging.info(f"Using patch size: {patch_size}")
             
-            self.train_loader = data_loaders['train']
-            self.val_loader = data_loaders['val']
+            try:
+                data_loaders = prepare_data_loaders(
+                    dataset_dir=self.dataset_dir,
+                    study_ids=study_ids,
+                    batch_size=self.training_batch_size,
+                    patch_size=patch_size,
+                    num_workers=4
+                )
+                
+                self.train_loader = data_loaders['train']
+                self.val_loader = data_loaders['val']
+                
+                logging.info(f"Loaded dataset with {len(data_loaders['dataset'])} sample pairs")
+                
+                return data_loaders
+            except Exception as e:
+                logging.error(f"Error loading dataset: {str(e)}")
+                raise
+    
+    def extract_patches_from_volume(self, volume, patch_size=None, overlap=None):
+        """
+        Extract overlapping patches from a volume for inference.
+        
+        Args:
+            volume: 3D numpy array (Z, Y, X)
+            patch_size: Tuple of (z, y, x) patch size
+            overlap: Tuple of (z, y, x) overlap between patches
             
-            logging.info(f"Loaded dataset with {len(data_loaders['dataset'])} sample pairs")
+        Returns:
+            List of (patch, coords) where coords is (z_start, y_start, x_start)
+        """
+        if patch_size is None:
+            patch_size = self.get_patch_size()
+        
+        if overlap is None:
+            overlap = self.get_patch_overlap()
+        
+        pz, py, px = patch_size
+        oz, oy, ox = overlap
+        z, y, x = volume.shape
+        
+        # Calculate step sizes with overlap
+        step_z = pz - oz
+        step_y = py - oy
+        step_x = px - ox
+        
+        # Calculate number of patches in each dimension
+        n_z = max(1, (z - pz) // step_z + 1 + (1 if (z - pz) % step_z > 0 else 0))
+        n_y = max(1, (y - py) // step_y + 1 + (1 if (y - py) % step_y > 0 else 0))
+        n_x = max(1, (x - px) // step_x + 1 + (1 if (x - px) % step_x > 0 else 0))
+        
+        # If the volume is smaller than patch size, use a single patch
+        if z < pz or y < py or x < px:
+            # Pad volume to patch size
+            pad_z = max(0, pz - z)
+            pad_y = max(0, py - y)
+            pad_x = max(0, px - x)
             
-            return data_loaders
+            padded_volume = np.pad(volume, 
+                                  ((0, pad_z), (0, pad_y), (0, pad_x)), 
+                                  mode='constant')
+            return [(padded_volume[:pz, :py, :px], (0, 0, 0))]
+        
+        patches = []
+        for iz in range(n_z):
+            for iy in range(n_y):
+                for ix in range(n_x):
+                    # Calculate start position of the patch
+                    z_start = min(iz * step_z, z - pz)
+                    y_start = min(iy * step_y, y - py)
+                    x_start = min(ix * step_x, x - px)
+                    
+                    # Extract the patch
+                    patch = volume[z_start:z_start+pz, y_start:y_start+py, x_start:x_start+px]
+                    patches.append((patch, (z_start, y_start, x_start)))
+        
+        return patches
+    
+    def stitch_patches_to_volume(self, patches, original_shape, patch_size=None, overlap=None):
+        """
+        Stitch a list of patches back into a volume using weighted averaging in overlapping regions.
+        
+        Args:
+            patches: List of (patch, coords) where coords is (z_start, y_start, x_start)
+            original_shape: Shape of the original volume (Z, Y, X)
+            patch_size: Tuple of (z, y, x) patch size
+            overlap: Tuple of (z, y, x) overlap between patches
+            
+        Returns:
+            Reconstructed volume as numpy array
+        """
+        if patch_size is None:
+            patch_size = self.get_patch_size()
+        
+        if overlap is None:
+            overlap = self.get_patch_overlap()
+        
+        z, y, x = original_shape
+        pz, py, px = patch_size
+        
+        # Initialize output volume and weight volume
+        output = np.zeros((z, y, x), dtype=np.float32)
+        weights = np.zeros((z, y, x), dtype=np.float32)
+        
+        # Create weight map for patches (higher weights in center, lower at edges)
+        weight_map = self._create_weight_map(patch_size)
+        
+        # Place each patch in the output volume with weighted averaging
+        for patch, (z_start, y_start, x_start) in patches:
+            # Calculate the actual patch size (might be smaller at boundaries)
+            z_end = min(z_start + pz, z)
+            y_end = min(y_start + py, y)
+            x_end = min(x_start + px, x)
+            
+            # Handle potentially smaller patch
+            p_z = z_end - z_start
+            p_y = y_end - y_start
+            p_x = x_end - x_start
+            
+            # Get actual patch and weight map
+            actual_patch = patch[:p_z, :p_y, :p_x]
+            actual_weights = weight_map[:p_z, :p_y, :p_x]
+            
+            # Add weighted patch to output
+            output[z_start:z_end, y_start:y_end, x_start:x_end] += actual_patch * actual_weights
+            weights[z_start:z_end, y_start:y_end, x_start:x_end] += actual_weights
+        
+        # Normalize output by weights
+        # Avoid division by zero
+        mask = weights > 0
+        output[mask] /= weights[mask]
+        
+        return output
+    
+    def _create_weight_map(self, patch_size):
+        """
+        Create a weight map for blending patches, with higher weights in the center
+        and lower weights at the edges.
+        
+        Args:
+            patch_size: Tuple of (z, y, x) patch size
+            
+        Returns:
+            3D numpy array with weights
+        """
+        pz, py, px = patch_size
+        
+        # Create 1D weight arrays using a cosine window
+        z_weights = np.cos((np.linspace(-np.pi/2, np.pi/2, pz)) ** 2)
+        y_weights = np.cos((np.linspace(-np.pi/2, np.pi/2, py)) ** 2)
+        x_weights = np.cos((np.linspace(-np.pi/2, np.pi/2, px)) ** 2)
+        
+        # Create 3D weight map using outer product
+        zz, yy, xx = np.meshgrid(z_weights, y_weights, x_weights, indexing='ij')
+        weight_map = zz * yy * xx
+        
+        return weight_map
 
 
 def packages(*names: str):
@@ -490,122 +649,35 @@ def load_image(image_path):
 
 
 def build_unet3d_model(input_shape, use_physics=False):
-    """Build a 3D U-Net model for single-view to multiview fusion.
+    """
+    Build a 3D U-Net model for single-view to multiview fusion.
     
     Args:
-        input_shape: Shape of the input volume (z, y, x)
+        input_shape: Shape of the input volume (z, y, x) or (c, z, y, x)
         use_physics: Whether to use physics-informed neural network
         
     Returns:
         model: PyTorch model for 3D image fusion
     """
-    import torch
-    import torch.nn as nn
+    import logging
     
-    class DoubleConv3D(nn.Module):
-        def __init__(self, in_channels, out_channels):
-            super(DoubleConv3D, self).__init__()
-            self.conv = nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
-                nn.BatchNorm3d(out_channels),
-                nn.ReLU(inplace=True),
-                nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-                nn.BatchNorm3d(out_channels),
-                nn.ReLU(inplace=True)
-            )
-        
-        def forward(self, x):
-            return self.conv(x)
+    # Determine whether input_shape includes channel dimension
+    if len(input_shape) == 3:  # If input_shape is (z, y, x)
+        in_channels = 1
+    elif len(input_shape) == 4:  # If input_shape is (c, z, y, x)
+        in_channels = input_shape[0]
+    else:
+        raise ValueError(f"Unexpected input shape: {input_shape}. Should be (z, y, x) or (c, z, y, x)")
     
-    class Down3D(nn.Module):
-        def __init__(self, in_channels, out_channels):
-            super(Down3D, self).__init__()
-            self.mpconv = nn.Sequential(
-                nn.MaxPool3d(2),
-                DoubleConv3D(in_channels, out_channels)
-            )
-        
-        def forward(self, x):
-            return self.mpconv(x)
-    
-    class Up3D(nn.Module):
-        def __init__(self, in_channels, out_channels, bilinear=False):
-            super(Up3D, self).__init__()
-            if bilinear:
-                self.up = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=True)
-            else:
-                self.up = nn.ConvTranspose3d(in_channels // 2, in_channels // 2, kernel_size=2, stride=2)
-            
-            self.conv = DoubleConv3D(in_channels, out_channels)
-        
-        def forward(self, x1, x2):
-            x1 = self.up(x1)
-            
-            # Pad x1 if needed for concatenation
-            diffZ = x2.size()[2] - x1.size()[2]
-            diffY = x2.size()[3] - x1.size()[3]
-            diffX = x2.size()[4] - x1.size()[4]
-            
-            x1 = torch.nn.functional.pad(
-                x1, (diffX // 2, diffX - diffX // 2,
-                     diffY // 2, diffY - diffY // 2,
-                     diffZ // 2, diffZ - diffZ // 2)
-            )
-            
-            # Concatenate along the channel dimension
-            x = torch.cat([x2, x1], dim=1)
-            return self.conv(x)
-    
-    class UNet3D(nn.Module):
-        def __init__(self, in_channels=1, out_channels=1, init_features=64):
-            super(UNet3D, self).__init__()
-            
-            # Initial convolution
-            self.inc = DoubleConv3D(in_channels, init_features)
-            
-            # Downsampling path
-            self.down1 = Down3D(init_features, init_features * 2)
-            self.down2 = Down3D(init_features * 2, init_features * 4)
-            self.down3 = Down3D(init_features * 4, init_features * 8)
-            self.down4 = Down3D(init_features * 8, init_features * 16)
-            
-            # Upsampling path
-            self.up1 = Up3D(init_features * 16 + init_features * 8, init_features * 8)
-            self.up2 = Up3D(init_features * 8 + init_features * 4, init_features * 4)
-            self.up3 = Up3D(init_features * 4 + init_features * 2, init_features * 2)
-            self.up4 = Up3D(init_features * 2 + init_features, init_features)
-            
-            # Output convolution
-            self.outc = nn.Conv3d(init_features, out_channels, kernel_size=1)
-        
-        def forward(self, x):
-            # Downsampling
-            x1 = self.inc(x)
-            x2 = self.down1(x1)
-            x3 = self.down2(x2)
-            x4 = self.down3(x3)
-            x5 = self.down4(x4)
-            
-            # Upsampling with skip connections
-            x = self.up1(x5, x4)
-            x = self.up2(x, x3)
-            x = self.up3(x, x2)
-            x = self.up4(x, x1)
-            
-            # Final output
-            x = self.outc(x)
-            return x
-            
-    # Create the basic UNet3D model
+    # Create appropriate model based on use_physics flag
     if use_physics:
-        # For a physics-informed model, we would add additional constraints
-        # This is a simplified example - in a real implementation, you would add
-        # physics-based loss terms and potentially modify the architecture
         logging.info("Creating physics-informed UNet3D model")
-        return UNet3D(in_channels=1, out_channels=1, init_features=64)
+        model = PhysicsInformedUNet3D(in_channels=in_channels, out_channels=1, init_features=64)
     else:
         logging.info("Creating standard UNet3D model")
-        return UNet3D(in_channels=1, out_channels=1, init_features=64)
+        model = UNet3D(in_channels=in_channels, out_channels=1, init_features=64)
+    
+    return model
 
 
 def compute_3d_ssim(img1, img2):

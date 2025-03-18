@@ -15,62 +15,8 @@ import numpy as np
 import pandas as pd
 import torch
 import tifffile
-from metaflow import Config, Parameter
 
-class BackendMixin:
-    """A mixin for managing the backend implementation of a model.
 
-    This mixin is designed to be combined with any pipeline that requires accessing
-    a hosted model. The mixin provides a common interface for interacting with the
-    model and its associated database.
-    """
-
-    backend_config = Config(
-        "backend-config",
-        help=("Backend configuration used to initialize the provided backend class."),
-    )
-
-    backend = Parameter(
-        "backend",
-        help="Name of the class implementing the `backend.Backend` abstract class.",
-        default="backend.Local",
-    )
-
-    def load_backend(self):
-        """Instantiate the backend class using the supplied configuration."""
-        try:
-            module, cls = self.backend.rsplit(".", 1)
-            module = importlib.import_module(module)
-            backend_impl = getattr(module, cls)(config=self._get_config())
-        except Exception as e:
-            message = f"There was an error instantiating class {self.backend}."
-            raise RuntimeError(message) from e
-        else:
-            logging.info("Backend: %s", self.backend)
-            return backend_impl
-
-    def _get_config(self):
-        """Return the backend configuration with environment variables expanded.
-
-        This function supports using ${ENVIRONMENT_VARIABLE} syntax as part of the
-        configuration values.
-        """
-        if not self.backend_config:
-            return None
-
-        config = self.backend_config.to_dict()
-        pattern = re.compile(r"\$\{(\w+)\}")
-
-        def replacer(match):
-            env_var = match.group(1)
-            return os.getenv(env_var, f"${{{env_var}}}")
-
-        for key, value in self.backend_config.items():
-            if isinstance(value, str):
-                config[key] = pattern.sub(replacer, value)
-
-        return config
-    
 def percentile_normalization(image, pmin=2, pmax=99.8, axis=None):
     """
     Compute a percentile normalization for the given image.
@@ -150,13 +96,150 @@ def compute_n_ssim(prediction, ground_truth, input_image):
     return n_ssim
 
 
-def predict_fused_view(model, single_view):
+def extract_patches_from_volume(volume, patch_size=(32, 64, 64), overlap=(8, 16, 16)):
+    """
+    Extract overlapping patches from a volume for inference.
+    
+    Args:
+        volume: 3D numpy array (Z, Y, X)
+        patch_size: Tuple of (z, y, x) patch size
+        overlap: Tuple of (z, y, x) overlap between patches
+        
+    Returns:
+        List of (patch, coords) where coords is (z_start, y_start, x_start)
+    """
+    pz, py, px = patch_size
+    oz, oy, ox = overlap
+    z, y, x = volume.shape
+    
+    # Calculate step sizes with overlap
+    step_z = pz - oz
+    step_y = py - oy
+    step_x = px - ox
+    
+    # Calculate number of patches in each dimension
+    n_z = max(1, (z - pz) // step_z + 1 + (1 if (z - pz) % step_z > 0 else 0))
+    n_y = max(1, (y - py) // step_y + 1 + (1 if (y - py) % step_y > 0 else 0))
+    n_x = max(1, (x - px) // step_x + 1 + (1 if (x - px) % step_x > 0 else 0))
+    
+    # If the volume is smaller than patch size, use a single patch
+    if z < pz or y < py or x < px:
+        # Pad volume to patch size
+        pad_z = max(0, pz - z)
+        pad_y = max(0, py - y)
+        pad_x = max(0, px - x)
+        
+        padded_volume = np.pad(volume, 
+                              ((0, pad_z), (0, pad_y), (0, pad_x)), 
+                              mode='constant')
+        return [(padded_volume[:pz, :py, :px], (0, 0, 0))]
+    
+    patches = []
+    for iz in range(n_z):
+        for iy in range(n_y):
+            for ix in range(n_x):
+                # Calculate start position of the patch
+                z_start = min(iz * step_z, z - pz)
+                y_start = min(iy * step_y, y - py)
+                x_start = min(ix * step_x, x - px)
+                
+                # Extract the patch
+                patch = volume[z_start:z_start+pz, y_start:y_start+py, x_start:x_start+px]
+                patches.append((patch, (z_start, y_start, x_start)))
+    
+    return patches
+
+
+def create_weight_map(patch_size):
+    """
+    Create a weight map for blending patches, with higher weights in the center
+    and lower weights at the edges.
+    
+    Args:
+        patch_size: Tuple of (z, y, x) patch size
+        
+    Returns:
+        3D numpy array with weights
+    """
+    pz, py, px = patch_size
+    
+    # Create 1D weight arrays using a cosine window
+    z_weights = np.cos((np.linspace(-np.pi/2, np.pi/2, pz)) ** 2)
+    y_weights = np.cos((np.linspace(-np.pi/2, np.pi/2, py)) ** 2)
+    x_weights = np.cos((np.linspace(-np.pi/2, np.pi/2, px)) ** 2)
+    
+    # Create 3D weight map using outer product
+    zz, yy, xx = np.meshgrid(z_weights, y_weights, x_weights, indexing='ij')
+    weight_map = zz * yy * xx
+    
+    return weight_map
+
+
+def stitch_patches_to_volume(patches, original_shape, patch_size=(32, 64, 64), overlap=(8, 16, 16)):
+    """
+    Stitch a list of patches back into a volume using weighted averaging in overlapping regions.
+    
+    Args:
+        patches: List of (patch, coords) where coords is (z_start, y_start, x_start)
+        original_shape: Shape of the original volume (Z, Y, X)
+        patch_size: Tuple of (z, y, x) patch size
+        overlap: Tuple of (z, y, x) overlap between patches
+        
+    Returns:
+        Reconstructed volume as numpy array
+    """
+    z, y, x = original_shape
+    pz, py, px = patch_size
+    
+    # Initialize output volume and weight volume
+    output = np.zeros((z, y, x), dtype=np.float32)
+    weights = np.zeros((z, y, x), dtype=np.float32)
+    
+    # Create weight map for patches (higher weights in center, lower at edges)
+    weight_map = create_weight_map(patch_size)
+    
+    # Place each patch in the output volume with weighted averaging
+    for patch, (z_start, y_start, x_start) in patches:
+        # Calculate the actual patch size (might be smaller at boundaries)
+        z_end = min(z_start + pz, z)
+        y_end = min(y_start + py, y)
+        x_end = min(x_start + px, x)
+        
+        # Handle potentially smaller patch
+        p_z = z_end - z_start
+        p_y = y_end - y_start
+        p_x = x_end - x_start
+        
+        # Get actual patch and weight map
+        actual_patch = patch[:p_z, :p_y, :p_x]
+        actual_weights = weight_map[:p_z, :p_y, :p_x]
+        
+        # Add weighted patch to output
+        output[z_start:z_end, y_start:y_end, x_start:x_end] += actual_patch * actual_weights
+        weights[z_start:z_end, y_start:y_end, x_start:x_end] += actual_weights
+    
+    # Normalize output by weights
+    # Avoid division by zero
+    mask = weights > 0
+    output[mask] /= weights[mask]
+    
+    return output
+
+
+def predict_fused_view(model, single_view, patch_size=(32, 64, 64), overlap=(8, 16, 16)):
     """
     Generate a fused multi-view prediction from a single view input.
+    
+    This function handles large volumes by:
+    1. Breaking the input into patches
+    2. Processing each patch through the model
+    3. Stitching the predictions back together
     
     Args:
         model: PyTorch model
         single_view: 3D numpy array (Z, Y, X)
+        patch_size: Size of patches to process
+        overlap: Overlap between adjacent patches
         
     Returns:
         fused_view: 3D numpy array (Z, Y, X)
@@ -164,22 +247,62 @@ def predict_fused_view(model, single_view):
     # Ensure model is in evaluation mode
     model.eval()
     
-    # Normalize input
-    normalized_input = percentile_normalization(single_view)
+    # Get original shape for reconstruction
+    original_shape = single_view.shape
     
-    # Convert to tensor and add batch and channel dimensions
-    input_tensor = torch.from_numpy(normalized_input).float().unsqueeze(0).unsqueeze(0)
+    # Handle small volumes directly
+    if all(dim <= max_dim for dim, max_dim in zip(original_shape, patch_size)):
+        # If volume is smaller than patch size, process directly
+        normalized_input = percentile_normalization(single_view)
+        input_tensor = torch.from_numpy(normalized_input).float().unsqueeze(0).unsqueeze(0)
+        
+        # Move to the same device as the model
+        device = next(model.parameters()).device
+        input_tensor = input_tensor.to(device)
+        
+        # Generate prediction
+        with torch.no_grad():
+            output_tensor = model(input_tensor)
+        
+        # Convert back to numpy
+        return output_tensor.cpu().squeeze().numpy()
     
-    # Move to the same device as the model
-    device = next(model.parameters()).device
-    input_tensor = input_tensor.to(device)
+    # For large volumes, process in patches
+    logging.info(f"Processing large volume of shape {original_shape} using patches of size {patch_size}")
     
-    # Generate prediction
-    with torch.no_grad():
-        output_tensor = model(input_tensor)
+    # Extract patches
+    patches = extract_patches_from_volume(single_view, patch_size, overlap)
+    logging.info(f"Extracted {len(patches)} patches")
     
-    # Convert back to numpy
-    fused_view = output_tensor.cpu().squeeze().numpy()
+    # Process each patch
+    processed_patches = []
+    for i, (patch, coords) in enumerate(patches):
+        # Normalize the patch
+        normalized_patch = percentile_normalization(patch)
+        
+        # Convert to tensor
+        patch_tensor = torch.from_numpy(normalized_patch).float().unsqueeze(0).unsqueeze(0)
+        
+        # Move to the same device as the model
+        device = next(model.parameters()).device
+        patch_tensor = patch_tensor.to(device)
+        
+        # Generate prediction
+        with torch.no_grad():
+            output_tensor = model(patch_tensor)
+        
+        # Convert back to numpy
+        output_patch = output_tensor.cpu().squeeze().numpy()
+        
+        # Store processed patch with its coordinates
+        processed_patches.append((output_patch, coords))
+        
+        if (i + 1) % 10 == 0:
+            logging.info(f"Processed {i + 1}/{len(patches)} patches")
+    
+    # Stitch patches back together
+    logging.info("Stitching patches together")
+    fused_view = stitch_patches_to_volume(processed_patches, original_shape, patch_size, overlap)
     
     return fused_view
 
@@ -305,9 +428,20 @@ class Local(Backend):
         # Data directory for storing TIFF files
         self.data_dir = os.path.join(os.path.dirname(self.database), "tiff_data")
         os.makedirs(self.data_dir, exist_ok=True)
+        
+        # Configure patch settings
+        if config and 'patch_config' in config:
+            patch_config = config['patch_config']
+            self.patch_size = patch_config.get('patch_size', (32, 64, 64))
+            self.patch_overlap = patch_config.get('patch_overlap', (8, 16, 16))
+        else:
+            self.patch_size = (32, 64, 64)
+            self.patch_overlap = (8, 16, 16)
 
         logging.info("Backend database: %s", self.database)
         logging.info("TIFF data directory: %s", self.data_dir)
+        logging.info("Using patch size: %s", self.patch_size)
+        logging.info("Using patch overlap: %s", self.patch_overlap)
 
     def load(self, limit: int = 100) -> pd.DataFrame | None:
         """Load production data from a SQLite database."""
@@ -378,8 +512,8 @@ class Local(Backend):
                     new_output_path = os.path.join(self.data_dir, f"{record_uuid}_output.tif")
                     try:
                         # Read and then write the file (to avoid file system issues)
-                        output_data = tifffile.imread(output_path)
-                        tifffile.imwrite(new_output_path, output_data)
+                        output_data_array = tifffile.imread(output_path)
+                        tifffile.imwrite(new_output_path, output_data_array)
                         output_path = new_output_path
                     except Exception as e:
                         logging.error(f"Failed to copy output file: {e}")
@@ -473,25 +607,135 @@ class Local(Backend):
                 connection.close()
 
     def invoke(self, payload: list | dict) -> dict | None:
-        """Make a prediction request to the hosted model."""
+        """Make a prediction request to the hosted model.
+        
+        For large volumes, this method automatically handles patch-based processing
+        to avoid memory issues.
+        """
         import requests
 
         logging.info('Running prediction on "%s"...', self.target)
 
         try:
-            predictions = requests.post(
-                url=self.target,
-                headers={"Content-Type": "application/json"},
-                data=json.dumps(
-                    {
-                        "inputs": payload,
-                    },
-                ),
-                timeout=5,
-            )
-            return predictions.json()
+            # Check if we need to process in patches
+            need_patching = False
+            if isinstance(payload, dict) and 'file_path' in payload:
+                # Check file size or dimensions
+                try:
+                    # Load only the header to check dimensions
+                    with tifffile.TiffFile(payload['file_path']) as tif:
+                        shape = tif.series[0].shape
+                        # If any dimension is larger than 512, use patching
+                        if any(dim > 512 for dim in shape):
+                            need_patching = True
+                            logging.info(f"Large input detected {shape}, will use patch-based processing")
+                except Exception as e:
+                    logging.warning(f"Could not check file dimensions: {e}")
+            
+            if need_patching:
+                return self._invoke_with_patches(payload)
+            else:
+                # Standard invocation for smaller files
+                predictions = requests.post(
+                    url=self.target,
+                    headers={"Content-Type": "application/json"},
+                    data=json.dumps(
+                        {
+                            "inputs": payload,
+                        },
+                    ),
+                    timeout=15,  # Longer timeout for image processing
+                )
+                return predictions.json()
         except Exception:
             logging.exception("There was an error sending traffic to the endpoint.")
+            return None
+    
+    def _invoke_with_patches(self, payload):
+        """Process large volumes by breaking them into patches."""
+        import requests
+        
+        try:
+            # Load the full image
+            if 'file_path' in payload:
+                input_image = tifffile.imread(payload['file_path'])
+            elif 'data' in payload and isinstance(payload['data'], np.ndarray):
+                input_image = payload['data']
+            else:
+                raise ValueError("Input must contain either 'file_path' or 'data'")
+            
+            # Extract patches
+            patches = extract_patches_from_volume(input_image, 
+                                                 patch_size=self.patch_size, 
+                                                 overlap=self.patch_overlap)
+            logging.info(f"Processing large input in {len(patches)} patches")
+            
+            # Process each patch
+            processed_patches = []
+            for i, (patch, coords) in enumerate(patches):
+                # Create payload for this patch
+                patch_payload = {
+                    'data': patch.tolist() if isinstance(patch, np.ndarray) else patch,
+                }
+                
+                # Make request for this patch
+                response = requests.post(
+                    url=self.target,
+                    headers={"Content-Type": "application/json"},
+                    data=json.dumps({"inputs": patch_payload}),
+                    timeout=10,
+                )
+                
+                # Parse response
+                patch_result = response.json()
+                
+                if isinstance(patch_result, list):
+                    patch_result = patch_result[0]  # Take first result if it's a list
+                
+                # Extract the prediction data
+                if 'fused_view' in patch_result:
+                    output_patch = np.array(patch_result['fused_view'])
+                elif 'output_path' in patch_result:
+                    output_patch = tifffile.imread(patch_result['output_path'])
+                else:
+                    raise ValueError(f"Unexpected response format: {patch_result}")
+                
+                # Store processed patch with coordinates
+                processed_patches.append((output_patch, coords))
+                
+                if (i + 1) % 5 == 0:
+                    logging.info(f"Processed {i+1}/{len(patches)} patches")
+            
+            # Stitch patches back together
+            output_volume = stitch_patches_to_volume(processed_patches, 
+                                                   input_image.shape,
+                                                   patch_size=self.patch_size,
+                                                   overlap=self.patch_overlap)
+            
+            # Save the stitched result to a temporary file
+            with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
+                output_path = tmp.name
+                tifffile.imwrite(output_path, output_volume)
+            
+            # Compute N-SSIM if ground truth is available
+            n_ssim = None
+            if 'ground_truth_path' in payload and payload['ground_truth_path']:
+                try:
+                    ground_truth = tifffile.imread(payload['ground_truth_path'])
+                    n_ssim = compute_n_ssim(output_volume, ground_truth, input_image)
+                except Exception as e:
+                    logging.warning(f"Error computing N-SSIM: {e}")
+            
+            # Return the final result
+            return {
+                'predictions': [{
+                    'output_path': output_path,
+                    'n_ssim': n_ssim
+                }]
+            }
+            
+        except Exception as e:
+            logging.exception(f"Error in patch-based processing: {e}")
             return None
 
     def deploy(self, model_uri: str, model_version: str) -> None:
@@ -541,10 +785,19 @@ class JsonLines(Backend):
         storage_dir = os.path.dirname(self.storage_file)
         if storage_dir and not os.path.exists(storage_dir):
             os.makedirs(storage_dir)
-
+            
+        # Configure patch settings
+        if config and 'patch_config' in config:
+            patch_config = config['patch_config']
+            self.patch_size = patch_config.get('patch_size', (32, 64, 64))
+            self.patch_overlap = patch_config.get('patch_overlap', (8, 16, 16))
+        else:
+            self.patch_size = (32, 64, 64)
+            self.patch_overlap = (8, 16, 16)
         logging.info("Backend storage file: %s", self.storage_file)
         logging.info("TIFF data directory: %s", self.data_dir)
-
+        logging.info("Using patch size: %s", self.patch_size)
+        logging.info("Using patch overlap: %s", self.patch_overlap)
     def load(self, limit: int = 100) -> pd.DataFrame | None:
         """Load production data from the JSON Lines file."""
         if not Path(self.storage_file).exists():
@@ -701,25 +954,135 @@ class JsonLines(Backend):
             return 0
 
     def invoke(self, payload: list | dict) -> dict | None:
-        """Make a prediction request to the hosted model."""
+        """Make a prediction request to the hosted model.
+        
+        For large volumes, this method automatically handles patch-based processing
+        to avoid memory issues.
+        """
         import requests
 
         logging.info('Running prediction on "%s"...', self.target)
 
         try:
-            predictions = requests.post(
-                url=self.target,
-                headers={"Content-Type": "application/json"},
-                data=json.dumps(
-                    {
-                        "inputs": payload,
-                    },
-                ),
-                timeout=5,
-            )
-            return predictions.json()
+            # Check if we need to process in patches
+            need_patching = False
+            if isinstance(payload, dict) and 'file_path' in payload:
+                # Check file size or dimensions
+                try:
+                    # Load only the header to check dimensions
+                    with tifffile.TiffFile(payload['file_path']) as tif:
+                        shape = tif.series[0].shape
+                        # If any dimension is larger than 512, use patching
+                        if any(dim > 512 for dim in shape):
+                            need_patching = True
+                            logging.info(f"Large input detected {shape}, will use patch-based processing")
+                except Exception as e:
+                    logging.warning(f"Could not check file dimensions: {e}")
+            
+            if need_patching:
+                return self._invoke_with_patches(payload)
+            else:
+                # Standard invocation for smaller files
+                predictions = requests.post(
+                    url=self.target,
+                    headers={"Content-Type": "application/json"},
+                    data=json.dumps(
+                        {
+                            "inputs": payload,
+                        },
+                    ),
+                    timeout=15,  # Longer timeout for image processing
+                )
+                return predictions.json()
         except Exception:
             logging.exception("There was an error sending traffic to the endpoint.")
+            return None
+    
+    def _invoke_with_patches(self, payload):
+        """Process large volumes by breaking them into patches."""
+        import requests
+        
+        try:
+            # Load the full image
+            if 'file_path' in payload:
+                input_image = tifffile.imread(payload['file_path'])
+            elif 'data' in payload and isinstance(payload['data'], np.ndarray):
+                input_image = payload['data']
+            else:
+                raise ValueError("Input must contain either 'file_path' or 'data'")
+            
+            # Extract patches
+            patches = extract_patches_from_volume(input_image, 
+                                                 patch_size=self.patch_size, 
+                                                 overlap=self.patch_overlap)
+            logging.info(f"Processing large input in {len(patches)} patches")
+            
+            # Process each patch
+            processed_patches = []
+            for i, (patch, coords) in enumerate(patches):
+                # Create payload for this patch
+                patch_payload = {
+                    'data': patch.tolist() if isinstance(patch, np.ndarray) else patch,
+                }
+                
+                # Make request for this patch
+                response = requests.post(
+                    url=self.target,
+                    headers={"Content-Type": "application/json"},
+                    data=json.dumps({"inputs": patch_payload}),
+                    timeout=10,
+                )
+                
+                # Parse response
+                patch_result = response.json()
+                
+                if isinstance(patch_result, list):
+                    patch_result = patch_result[0]  # Take first result if it's a list
+                
+                # Extract the prediction data
+                if 'fused_view' in patch_result:
+                    output_patch = np.array(patch_result['fused_view'])
+                elif 'output_path' in patch_result:
+                    output_patch = tifffile.imread(patch_result['output_path'])
+                else:
+                    raise ValueError(f"Unexpected response format: {patch_result}")
+                
+                # Store processed patch with coordinates
+                processed_patches.append((output_patch, coords))
+                
+                if (i + 1) % 5 == 0:
+                    logging.info(f"Processed {i+1}/{len(patches)} patches")
+            
+            # Stitch patches back together
+            output_volume = stitch_patches_to_volume(processed_patches, 
+                                                   input_image.shape,
+                                                   patch_size=self.patch_size,
+                                                   overlap=self.patch_overlap)
+            
+            # Save the stitched result to a temporary file
+            with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
+                output_path = tmp.name
+                tifffile.imwrite(output_path, output_volume)
+            
+            # Compute N-SSIM if ground truth is available
+            n_ssim = None
+            if 'ground_truth_path' in payload and payload['ground_truth_path']:
+                try:
+                    ground_truth = tifffile.imread(payload['ground_truth_path'])
+                    n_ssim = compute_n_ssim(output_volume, ground_truth, input_image)
+                except Exception as e:
+                    logging.warning(f"Error computing N-SSIM: {e}")
+            
+            # Return the final result
+            return {
+                'predictions': [{
+                    'output_path': output_path,
+                    'n_ssim': n_ssim
+                }]
+            }
+            
+        except Exception as e:
+            logging.exception(f"Error in patch-based processing: {e}")
             return None
 
     def deploy(self, model_uri: str, model_version: str) -> None:
@@ -766,6 +1129,15 @@ class Sagemaker(Backend):
         # Data directory for storing temporary TIFF files
         self.temp_dir = tempfile.mkdtemp(prefix="sagemaker_fusemycell_")
         
+        # Configure patch settings
+        if config and 'patch_config' in config:
+            patch_config = config['patch_config']
+            self.patch_size = patch_config.get('patch_size', (32, 64, 64))
+            self.patch_overlap = patch_config.get('patch_overlap', (8, 16, 16))
+        else:
+            self.patch_size = (32, 64, 64)
+            self.patch_overlap = (8, 16, 16)
+        
         logging.info("Target: %s", self.target)
         logging.info("Data capture URI: %s", self.data_capture_uri)
         logging.info("Ground truth URI: %s", self.ground_truth_uri)
@@ -773,6 +1145,8 @@ class Sagemaker(Backend):
         logging.info("Region: %s", self.region)
         logging.info("Deployment target URI: %s", self.deployment_target_uri)
         logging.info("Temporary directory: %s", self.temp_dir)
+        logging.info("Using patch size: %s", self.patch_size)
+        logging.info("Using patch overlap: %s", self.patch_overlap)
 
     def load(self, limit: int = 100) -> pd.DataFrame:
         """Load production data from an S3 bucket."""
@@ -885,25 +1259,139 @@ class Sagemaker(Backend):
 
         return len(data)
     
+    def save(self, model_input: list | dict, model_output: list) -> None:
+        """Not implemented for Sagemaker.
+
+        Models deployed on Sagemaker will use data capture to automatically store
+        inference data. No need to manually save data.
+        """
+        logging.info("Save method not implemented for Sagemaker backend. Data capture is automatic.")
+        
     def invoke(self, payload: list | dict) -> dict | None:
         """Make a prediction request to the Sagemaker endpoint."""
         logging.info('Running prediction on "%s"...', self.target)
 
-        response = self.deployment_client.predict(
-            self.target,
-            json.dumps(
-                {
-                    "inputs": payload,
-                },
-            ),
-        )
+        # Check if we need to process in patches
+        need_patching = False
+        if isinstance(payload, dict) and 'file_path' in payload:
+            # Check file size or dimensions
+            try:
+                # Load only the header to check dimensions
+                with tifffile.TiffFile(payload['file_path']) as tif:
+                    shape = tif.series[0].shape
+                    # If any dimension is larger than 512, use patching
+                    if any(dim > 512 for dim in shape):
+                        need_patching = True
+                        logging.info(f"Large input detected {shape}, will use patch-based processing")
+            except Exception as e:
+                logging.warning(f"Could not check file dimensions: {e}")
         
-        # For FuseMyCell, the response structure will be different from penguin classifier
-        # We return the full JSON response 
-        logging.info("Received prediction response from endpoint")
+        if need_patching:
+            return self._invoke_with_patches(payload)
+        else:
+            # Standard invocation for smaller files
+            try:
+                response = self.deployment_client.predict(
+                    self.target,
+                    json.dumps(
+                        {
+                            "inputs": payload,
+                        },
+                    ),
+                )
+                
+                # For FuseMyCell, the response structure will be different from penguin classifier
+                # We return the full JSON response 
+                logging.info("Received prediction response from endpoint")
+                
+                return response
+            except Exception as e:
+                logging.exception(f"Error invoking Sagemaker endpoint: {e}")
+                return None
         
-        return response
-        
+    def _invoke_with_patches(self, payload):
+        """Process large volumes by breaking them into patches."""
+        try:
+            # Load the full image
+            if 'file_path' in payload:
+                input_image = tifffile.imread(payload['file_path'])
+            elif 'data' in payload and isinstance(payload['data'], np.ndarray):
+                input_image = payload['data']
+            else:
+                raise ValueError("Input must contain either 'file_path' or 'data'")
+            
+            # Extract patches
+            patches = extract_patches_from_volume(input_image, 
+                                                 patch_size=self.patch_size, 
+                                                 overlap=self.patch_overlap)
+            logging.info(f"Processing large input in {len(patches)} patches")
+            
+            # Process each patch
+            processed_patches = []
+            for i, (patch, coords) in enumerate(patches):
+                # Create payload for this patch
+                patch_payload = {
+                    'data': patch.tolist() if isinstance(patch, np.ndarray) else patch,
+                }
+                
+                # Make request for this patch
+                response = self.deployment_client.predict(
+                    self.target,
+                    json.dumps({"inputs": patch_payload}),
+                )
+                
+                # Parse response
+                patch_result = response
+                
+                if isinstance(patch_result, list):
+                    patch_result = patch_result[0]  # Take first result if it's a list
+                
+                # Extract the prediction data
+                if 'fused_view' in patch_result:
+                    output_patch = np.array(patch_result['fused_view'])
+                elif 'output_path' in patch_result:
+                    output_patch = tifffile.imread(patch_result['output_path'])
+                else:
+                    raise ValueError(f"Unexpected response format: {patch_result}")
+                
+                # Store processed patch with coordinates
+                processed_patches.append((output_patch, coords))
+                
+                if (i + 1) % 5 == 0:
+                    logging.info(f"Processed {i+1}/{len(patches)} patches")
+            
+            # Stitch patches back together
+            output_volume = stitch_patches_to_volume(processed_patches, 
+                                                   input_image.shape,
+                                                   patch_size=self.patch_size,
+                                                   overlap=self.patch_overlap)
+            
+            # Save the stitched result to a temporary file
+            with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
+                output_path = tmp.name
+                tifffile.imwrite(output_path, output_volume)
+            
+            # Compute N-SSIM if ground truth is available
+            n_ssim = None
+            if 'ground_truth_path' in payload and payload['ground_truth_path']:
+                try:
+                    ground_truth = tifffile.imread(payload['ground_truth_path'])
+                    n_ssim = compute_n_ssim(output_volume, ground_truth, input_image)
+                except Exception as e:
+                    logging.warning(f"Error computing N-SSIM: {e}")
+            
+            # Return the final result
+            return {
+                'predictions': [{
+                    'output_path': output_path,
+                    'n_ssim': n_ssim
+                }]
+            }
+            
+        except Exception as e:
+            logging.exception(f"Error in patch-based processing: {e}")
+            return None
+            
     def deploy(self, model_uri: str, model_version: str) -> None:
         """Deploy the model to Sagemaker.
 
@@ -1090,7 +1578,7 @@ class Sagemaker(Backend):
             flavor="python_function",
             config=deployment_configuration,
         )
-        
+
     def _parse_s3_uri(self, uri):
         """Parse an S3 URI into bucket and key components."""
         if not uri.startswith('s3://'):
@@ -1251,7 +1739,231 @@ class Sagemaker(Backend):
 
         # Concatenate all DataFrames into a single DataFrame
         return pd.concat(dfs, ignore_index=True) if dfs else None
-
+    
+class FuseMyCellWrapper:
+    """
+    A wrapper class that loads artifacts and implements prediction logic for the FuseMyCell model.
+    This class is used by MLflow's pyfunc model flavor.
+    """
+    
+    def __init__(self, model_path):
+        """
+        Load model and artifacts from the given path.
+        
+        Args:
+            model_path: Path to the directory containing model artifacts
+        """
+        import torch
+        import importlib.util
+        from pathlib import Path
+        
+        logging.info(f"Loading FuseMyCell model from {model_path}")
+        self.model_path = model_path
+        
+        # Load model architecture
+        artifacts_dir = Path(model_path) / "artifacts"
+        
+        # Load patch configuration if available
+        try:
+            patch_config_path = artifacts_dir / "patch_config.json"
+            if patch_config_path.exists():
+                with open(patch_config_path, 'r') as f:
+                    patch_config = json.load(f)
+                self.patch_size = tuple(patch_config.get("patch_size", (32, 64, 64)))
+                self.patch_overlap = tuple(patch_config.get("patch_overlap", (8, 16, 16)))
+                self.percentile_min = patch_config.get("percentile_min", 2)
+                self.percentile_max = patch_config.get("percentile_max", 98)
+            else:
+                # Default values
+                self.patch_size = (32, 64, 64)
+                self.patch_overlap = (8, 16, 16)
+                self.percentile_min = 2
+                self.percentile_max = 98
+        except Exception as e:
+            logging.warning(f"Error loading patch configuration: {e}")
+            # Default values
+            self.patch_size = (32, 64, 64)
+            self.patch_overlap = (8, 16, 16)
+            self.percentile_min = 2
+            self.percentile_max = 98
+        
+        logging.info(f"Using patch size: {self.patch_size}, overlap: {self.patch_overlap}")
+        
+        # Import the model definition
+        spec = importlib.util.spec_from_file_location(
+            "unet3d", 
+            Path(model_path) / "code" / "unet3d.py"
+        )
+        unet_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(unet_module)
+        
+        # Determine device (CPU or GPU)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logging.info(f"Using device: {self.device}")
+        
+        # Create model instance
+        self.model = unet_module.UNet3D(in_channels=1, out_channels=1, init_features=64)
+        
+        # Load model weights
+        self.model.load_state_dict(torch.load(
+            artifacts_dir / "model.pth", 
+            map_location=self.device
+        ))
+        self.model = self.model.to(self.device)
+        self.model.eval()
+        
+        logging.info("FuseMyCell model loaded successfully")
+    
+    def predict(self, context, model_input):
+        """
+        Generate fused view predictions from single view inputs.
+        
+        This method handles large volumes by breaking them into patches.
+        
+        Args:
+            context: MLflow model context
+            model_input: List of dictionaries or a single dictionary containing input data
+                Keys can include:
+                - 'file_path': Path to input TIFF file
+                - 'data': Input numpy array
+                - 'ground_truth_path': Optional path to ground truth image
+                
+        Returns:
+            List of dictionaries containing prediction results
+        """
+        # Ensure model_input is a list
+        if not isinstance(model_input, list):
+            model_input = [model_input]
+        
+        predictions = []
+        for i, input_data in enumerate(model_input):
+            try:
+                # Process input (which could be a file path or numpy array)
+                single_view = self._load_input(input_data)
+                
+                # Determine if we need patch-based processing
+                large_volume = False
+                for dim in single_view.shape:
+                    if dim > 512:  # Arbitrary threshold for "large"
+                        large_volume = True
+                        break
+                
+                if large_volume:
+                    logging.info(f"Processing large volume of shape {single_view.shape} using patches")
+                    fused_view = self._process_volume_with_patches(single_view)
+                else:
+                    # For smaller volumes, process directly
+                    fused_view = predict_fused_view(self.model, single_view)
+                
+                # Save prediction to a temporary file
+                with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp:
+                    output_path = tmp.name
+                    tifffile.imwrite(output_path, fused_view)
+                
+                # Compute N-SSIM if ground truth is available
+                n_ssim = None
+                if 'ground_truth_path' in input_data and input_data['ground_truth_path']:
+                    try:
+                        ground_truth = tifffile.imread(input_data['ground_truth_path'])
+                        # Ensure ground_truth has correct dimensions
+                        if len(ground_truth.shape) == 2:
+                            ground_truth = ground_truth[np.newaxis, ...]
+                        elif len(ground_truth.shape) == 4:
+                            ground_truth = ground_truth[..., 0]
+                        
+                        n_ssim = compute_n_ssim(fused_view, ground_truth, single_view)
+                    except Exception as e:
+                        logging.warning(f"Error computing N-SSIM: {e}")
+                
+                predictions.append({
+                    'output_path': output_path,
+                    'n_ssim': n_ssim
+                })
+                
+            except Exception as e:
+                logging.error(f"Error processing input {i}: {e}")
+                predictions.append({'error': str(e)})
+        
+        return predictions
+    
+    def _load_input(self, input_data):
+        """Load and preprocess input data."""
+        # Handle input from file path
+        if 'file_path' in input_data:
+            file_path = input_data['file_path']
+            logging.info(f"Loading input from file: {file_path}")
+            try:
+                single_view = tifffile.imread(file_path)
+                
+                # Handle different dimensions
+                if len(single_view.shape) == 2:  # Single 2D image
+                    single_view = single_view[np.newaxis, ...]
+                elif len(single_view.shape) == 4:  # Multiple channels
+                    # For simplicity, just take the first channel
+                    single_view = single_view[..., 0]
+                
+            except Exception as e:
+                raise ValueError(f"Error loading input file: {str(e)}")
+        elif 'data' in input_data:
+            # Input is a numpy array
+            single_view = input_data['data']
+            if not isinstance(single_view, np.ndarray):
+                raise ValueError(f"Input data must be a numpy array, got {type(single_view)}")
+        else:
+            raise ValueError("Input must contain either 'file_path' or 'data'")
+        
+        return single_view
+    
+    def _process_volume_with_patches(self, volume):
+        """
+        Process a large volume by breaking it into overlapping patches.
+        
+        Args:
+            volume: 3D numpy array
+            
+        Returns:
+            3D numpy array of predictions
+        """
+        # Extract patches
+        patches = extract_patches_from_volume(volume, 
+                                             patch_size=self.patch_size, 
+                                             overlap=self.patch_overlap)
+        logging.info(f"Extracted {len(patches)} patches")
+        
+        # Process each patch
+        processed_patches = []
+        for i, (patch, coords) in enumerate(patches):
+            # Normalize the patch
+            normalized_patch = percentile_normalization(patch, 
+                                                      pmin=self.percentile_min,
+                                                      pmax=self.percentile_max)
+            
+            # Convert to tensor and add batch and channel dimensions
+            patch_tensor = torch.from_numpy(normalized_patch).float().unsqueeze(0).unsqueeze(0)
+            patch_tensor = patch_tensor.to(self.device)
+            
+            # Generate prediction
+            with torch.no_grad():
+                output_tensor = self.model(patch_tensor)
+            
+            # Convert back to numpy
+            output_patch = output_tensor.cpu().squeeze().numpy()
+            
+            # Store processed patch with its coordinates
+            processed_patches.append((output_patch, coords))
+            
+            if (i + 1) % 10 == 0:
+                logging.info(f"Processed {i + 1}/{len(patches)} patches")
+        
+        # Stitch patches back together
+        logging.info("Stitching patches together")
+        output_volume = stitch_patches_to_volume(processed_patches,
+                                               volume.shape,
+                                               patch_size=self.patch_size,
+                                               overlap=self.patch_overlap)
+        
+        return output_volume
+    
 class Mock(Backend):
     """Mock implementation of the Backend abstract class.
 
@@ -1269,6 +1981,15 @@ class Mock(Backend):
         
         # Track ground truth data
         self.ground_truth = {}
+        
+        # Configure patch settings
+        if config and 'patch_config' in config:
+            patch_config = config['patch_config']
+            self.patch_size = patch_config.get('patch_size', (32, 64, 64))
+            self.patch_overlap = patch_config.get('patch_overlap', (8, 16, 16))
+        else:
+            self.patch_size = (32, 64, 64)
+            self.patch_overlap = (8, 16, 16)
         
     def load(self, limit: int = 100) -> pd.DataFrame | None:
         """Return fake data for testing purposes."""
