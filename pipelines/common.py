@@ -29,6 +29,61 @@ PACKAGES = {
     "cellpose": "2.2.4",
 }
 
+def apply_gradient_augmentations(angle_tensor, fused_tensor=None, apply_augs=True, seed=None):
+    """
+    Apply augmentations to handle variable gradient directions in both Z and XY planes.
+    
+    Args:
+        angle_tensor: PyTorch tensor of shape [C, Z, Y, X] for single-view input
+        fused_tensor: PyTorch tensor of shape [C, Z, Y, X] for fused-view target (optional)
+        apply_augs: Whether to apply augmentations (set to False during validation/inference)
+        seed: Random seed for reproducible augmentations
+        
+    Returns:
+        Tuple of augmented (angle_tensor, fused_tensor) or just angle_tensor if fused_tensor is None
+    """
+    import random
+    
+    # Only apply augmentations when requested
+    if not apply_augs:
+        if fused_tensor is not None:
+            return angle_tensor, fused_tensor
+        return angle_tensor
+    
+    # Set seed for reproducibility if provided
+    if seed is not None:
+        random.seed(seed)
+    
+    # Generate flip decisions
+    flip_z = random.random() > 0.5
+    flip_x = random.random() > 0.5
+    flip_y = random.random() > 0.5
+    
+    # Flip in Z direction (50% chance)
+    if flip_z:
+        angle_tensor = torch.flip(angle_tensor, dims=[1])  # Flip Z dimension
+        if fused_tensor is not None:
+            fused_tensor = torch.flip(fused_tensor, dims=[1])
+        
+    # Flip in X direction (50% chance)
+    if flip_x:
+        angle_tensor = torch.flip(angle_tensor, dims=[3])  # Flip X dimension
+        if fused_tensor is not None:
+            fused_tensor = torch.flip(fused_tensor, dims=[3])
+        
+    # Flip in Y direction (50% chance)
+    if flip_y:
+        angle_tensor = torch.flip(angle_tensor, dims=[2])  # Flip Y dimension
+        if fused_tensor is not None:
+            fused_tensor = torch.flip(fused_tensor, dims=[2])
+    
+    # Reset seed if it was set
+    if seed is not None:
+        random.seed()
+    
+    if fused_tensor is not None:
+        return angle_tensor, fused_tensor
+    return angle_tensor
 
 class FuseMyCellDataset(Dataset):
     """
@@ -44,7 +99,8 @@ class FuseMyCellDataset(Dataset):
         patch_size=(64, 128, 128),
         random_crop=True,
         max_samples=None,
-        file_pattern=None
+        file_pattern=None,
+        apply_augmentations=True
     ):
         """
         Initialize the dataset.
@@ -57,11 +113,13 @@ class FuseMyCellDataset(Dataset):
             random_crop: Whether to use random crops during training
             max_samples: Maximum number of samples to use (for testing)
             file_pattern: Optional custom file pattern
+            apply_augmentations: Whether to apply gradient direction augmentations
         """
         self.root_dir = Path(root_dir)
         self.transform = transform
         self.patch_size = patch_size
         self.random_crop = random_crop
+        self.apply_augmentations = apply_augmentations
         
         # Define study ranges
         self.studies = {
@@ -189,6 +247,14 @@ class FuseMyCellDataset(Dataset):
         # Convert to tensors
         angle_tensor = torch.from_numpy(angle_patch).float().unsqueeze(0)  # Add channel dimension
         fused_tensor = torch.from_numpy(fused_patch).float().unsqueeze(0)  # Add channel dimension
+        
+        # Apply gradient direction augmentations
+        if self.apply_augmentations:
+            angle_tensor, fused_tensor = apply_gradient_augmentations(
+                angle_tensor, 
+                fused_tensor,
+                apply_augs=self.random_crop  # Only apply when in training mode
+            )
         
         # Apply transforms if specified
         if self.transform:
