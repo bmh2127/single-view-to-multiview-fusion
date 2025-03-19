@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple
 import math
+import random
 
 import numpy as np
 import pydantic
@@ -29,6 +30,7 @@ class Input(pydantic.BaseModel):
     ground_truth_path: Optional[str] = None  # Path to ground truth image for evaluation
     use_patches: Optional[bool] = False  # Whether to use patch-based inference
     patch_overlap: Optional[List[int]] = None  # [z, y, x] dimensions for patch overlap
+    apply_augmentations: Optional[bool] = False  # Whether to apply gradient direction augmentations
 
 
 class Output(pydantic.BaseModel):
@@ -40,6 +42,49 @@ class Output(pydantic.BaseModel):
     n_ssim: Optional[float] = None      # Normalized SSIM score if ground truth is provided
     output_path: Optional[str] = None   # Path to the saved output TIFF file
 
+
+def apply_gradient_augmentations(tensor, apply_augs=True, seed=None):
+    """
+    Apply augmentations to handle variable gradient directions in both Z and XY planes.
+    
+    Args:
+        tensor: PyTorch tensor of shape [C, Z, Y, X] for input
+        apply_augs: Whether to apply augmentations (set to False during validation/inference)
+        seed: Random seed for reproducible augmentations
+        
+    Returns:
+        Augmented tensor
+    """
+    # Only apply augmentations when requested
+    if not apply_augs:
+        return tensor
+    
+    # Set seed for reproducibility if provided
+    if seed is not None:
+        random.seed(seed)
+    
+    # Generate flip decisions
+    flip_z = random.random() > 0.5
+    flip_x = random.random() > 0.5
+    flip_y = random.random() > 0.5
+    
+    # Flip in Z direction (50% chance)
+    if flip_z:
+        tensor = torch.flip(tensor, dims=[1])  # Flip Z dimension
+    
+    # Flip in X direction (50% chance)
+    if flip_x:
+        tensor = torch.flip(tensor, dims=[3])  # Flip X dimension
+    
+    # Flip in Y direction (50% chance)
+    if flip_y:
+        tensor = torch.flip(tensor, dims=[2])  # Flip Y dimension
+    
+    # Reset seed if it was set
+    if seed is not None:
+        random.seed()
+    
+    return tensor
 
 class Model(mlflow.pyfunc.PythonModel):
     """A custom model implementing an inference pipeline for single-view to multiview fusion.
@@ -176,6 +221,11 @@ class Model(mlflow.pyfunc.PythonModel):
         if not isinstance(patch_overlap, list) or len(patch_overlap) != 3:
             patch_overlap = [16, 32, 32]
         
+        # Check if we should apply augmentations
+        apply_augs = sample.get('apply_augmentations', False)
+        if apply_augs:
+            logging.info("Using gradient direction augmentations for patch-based inference")
+        
         # Extract patches
         patches = self._extract_patches_from_volume(normalized_volume, patch_size, patch_overlap)
         logging.info(f"Extracted {len(patches)} patches from volume of shape {normalized_volume.shape}")
@@ -186,10 +236,42 @@ class Model(mlflow.pyfunc.PythonModel):
             for patch, coords in patches:
                 # Convert to tensor and add batch & channel dimensions
                 patch_tensor = torch.from_numpy(patch).float().unsqueeze(0).unsqueeze(0)
+                
+                # Apply gradient direction augmentations if requested
+                if apply_augs:
+                    # Use patch coordinates as part of the seed for reproducible results
+                    seed = sum(coords)
+                    patch_tensor = apply_gradient_augmentations(
+                        patch_tensor, 
+                        apply_augs=True,
+                        seed=seed
+                    )
+                
                 patch_tensor = patch_tensor.to(self.device)
                 
                 # Generate prediction
                 output_patch = self.model(patch_tensor)
+                
+                # If augmentations were applied, apply inverse augmentations to the output
+                if apply_augs:
+                    # Use same seed for reproducibility
+                    random.seed(seed)
+                    
+                    # Recompute the same flip decisions
+                    flip_z = random.random() > 0.5
+                    flip_x = random.random() > 0.5
+                    flip_y = random.random() > 0.5
+                    
+                    # Apply inverse flips in reverse order
+                    if flip_y:
+                        output_patch = torch.flip(output_patch, dims=[2])
+                    if flip_x:
+                        output_patch = torch.flip(output_patch, dims=[3])
+                    if flip_z:
+                        output_patch = torch.flip(output_patch, dims=[1])
+                    
+                    # Reset seed
+                    random.seed()
                 
                 # Save output patch and coordinates
                 output_patches.append((output_patch[0, 0].cpu().numpy(), coords))
@@ -329,6 +411,17 @@ class Model(mlflow.pyfunc.PythonModel):
             
             # Convert to tensor and add batch and channel dimensions
             input_tensor = torch.from_numpy(normalized_volume).float().unsqueeze(0).unsqueeze(0)
+            
+            # Apply gradient direction augmentations if requested
+            apply_augs = input_data.get('apply_augmentations', False)
+            if apply_augs:
+                input_tensor = apply_gradient_augmentations(
+                    input_tensor,
+                    apply_augs=True,
+                    # Use deterministic augmentation for reproducibility
+                    seed=42
+                )
+                logging.info("Applied gradient direction augmentations")
             
             # Move to the appropriate device
             input_tensor = input_tensor.to(self.device)

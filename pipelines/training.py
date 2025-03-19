@@ -30,16 +30,16 @@ configure_logging()
 # pytorch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1
 @project(name="fusemycell")
 @conda_base(
-    python="3.12",
+    python="3.12.9",
     libraries={
-        "pytorch::pytorch": "",  # Latest version
-        "pytorch::torchvision": "",  # Latest version
-        "pytorch::torchaudio": "",  # Latest version
+        "conda-forge::pytorch": "2.6.0",
+        "conda-forge::torchvision": "0.21",  # Latest version
+        # "conda-forge::torchaudio": "2.6.0",  # Latest version
         "conda-forge::pandas": "",
         "conda-forge::numpy": "",
-        "conda-forge::mlflow": "2.20.2",
-        "conda-forge::tifffile": "2024.2.12",
-        "conda-forge::scikit-image": "0.22.0",
+        "conda-forge::mlflow": "",
+        "conda-forge::tifffile": "",
+        "conda-forge::scikit-image": "",
         "conda-forge::matplotlib": "",
         "conda-forge::boto3": "",
         "conda-forge::metaflow": "",
@@ -153,7 +153,6 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
     def create_model(self):
         """Create the 3D U-Net model for image fusion."""
         import torch
-        
         # Get input shape from patch size
         patch_size = self.get_patch_size()
         input_shape = (1, *patch_size)  # (C, Z, Y, X)
@@ -181,7 +180,7 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
         
         # Continue to training
         self.next(self.train_model)
-    
+        
     @card
     @resources(memory=8192, gpu=1)
     @environment(vars={"CUDA_VISIBLE_DEVICES": "0", "PYTORCH_ENABLE_MPS_FALLBACK": "1"})
