@@ -13,7 +13,7 @@ import tifffile
 from torch.utils.data import Dataset, DataLoader
 from metaflow import IncludeFile, Parameter, current, S3
 from unet3d import UNet3D, PhysicsInformedUNet3D
-
+from gradient_analysis import analyze_gradient_direction, normalize_gradient_direction, visualize_gradient_analysis
 PYTHON = "3.12.8"
 
 PACKAGES = {
@@ -100,7 +100,8 @@ class FuseMyCellDataset(Dataset):
         random_crop=True,
         max_samples=None,
         file_pattern=None,
-        apply_augmentations=True
+        apply_augmentations=True,
+        normalize_gradients=False
     ):
         """
         Initialize the dataset.
@@ -120,6 +121,7 @@ class FuseMyCellDataset(Dataset):
         self.patch_size = patch_size
         self.random_crop = random_crop
         self.apply_augmentations = apply_augmentations
+        self.normalize_gradients = normalize_gradients 
         
         # Define study ranges
         self.studies = {
@@ -214,28 +216,44 @@ class FuseMyCellDataset(Dataset):
                 - 'target': Fused-view image tensor
                 - 'file_path': Path to the input file
         """
-        angle_file, fused_file = self.file_pairs[idx]
-        
-        # Load the TIFF files
-        try:
-            angle_img = tifffile.imread(angle_file)
-            fused_img = tifffile.imread(fused_file)
-        except Exception as e:
-            logging.error(f"Error loading files {angle_file} and {fused_file}: {e}")
-            # Return a placeholder if loading fails
-            return self.__getitem__((idx + 1) % len(self))
-        
-        # Ensure 3D format (handle 2D images)
-        if len(angle_img.shape) == 2:
-            angle_img = angle_img[np.newaxis, ...]
-        if len(fused_img.shape) == 2:
-            fused_img = fused_img[np.newaxis, ...]
+        def __getitem__(self, idx):
+            angle_file, fused_file = self.file_pairs[idx]
             
-        # Handle 4D images (with channels)
-        if len(angle_img.shape) == 4:
-            angle_img = angle_img[..., 0]  # Take first channel
-        if len(fused_img.shape) == 4:
-            fused_img = fused_img[..., 0]  # Take first channel
+            # Load the TIFF files
+            try:
+                angle_img = tifffile.imread(angle_file)
+                fused_img = tifffile.imread(fused_file)
+            except Exception as e:
+                logging.error(f"Error loading files {angle_file} and {fused_file}: {e}")
+                # Return a placeholder if loading fails
+                return self.__getitem__((idx + 1) % len(self))
+            
+            # Ensure 3D format (handle 2D images)
+            if len(angle_img.shape) == 2:
+                angle_img = angle_img[np.newaxis, ...]
+            if len(fused_img.shape) == 2:
+                fused_img = fused_img[np.newaxis, ...]
+                
+            # Handle 4D images (with channels)
+            if len(angle_img.shape) == 4:
+                angle_img = angle_img[..., 0]
+            if len(fused_img.shape) == 4:
+                fused_img = fused_img[..., 0]
+            
+            # Apply gradient direction normalization if requested
+            if self.normalize_gradients:
+                angle_img, gradient_info = normalize_gradient_direction(angle_img)
+                # Use the same direction for the fused image
+                target_directions = {
+                    'z_direction': gradient_info['z_direction'],
+                    'y_direction': gradient_info['y_direction'],
+                    'x_direction': gradient_info['x_direction']
+                }
+                fused_img, _ = normalize_gradient_direction(fused_img, target_directions)
+                
+                # Log gradient info occasionally
+                if idx % 100 == 0:
+                    logging.info(f"Gradient info for sample {idx}: {gradient_info}")
         
         # Apply normalization
         angle_img = self._normalize(angle_img)
@@ -363,7 +381,9 @@ def prepare_data_loaders(dataset_dir, study_ids=None, batch_size=4, patch_size=(
         study_ids=study_ids,
         patch_size=patch_size,
         random_crop=True,
-        max_samples=max_samples
+        max_samples=max_samples,
+        apply_augmentations=True,
+        normalize_gradients=False
     )
     
     # Split into training and validation sets
@@ -481,7 +501,8 @@ class DatasetMixin:
                     study_ids=study_ids,
                     batch_size=self.training_batch_size,
                     patch_size=patch_size,
-                    num_workers=4
+                    num_workers=4,
+                    normalize_gradients=self.normalize_gradients  # Pass the parameter
                 )
                 
                 self.train_loader = data_loaders['train']

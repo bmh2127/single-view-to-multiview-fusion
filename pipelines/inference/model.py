@@ -15,7 +15,7 @@ import tifffile
 import mlflow
 from mlflow.models import set_model
 from mlflow.pyfunc.model import PythonModelContext
-
+from pipelines.gradient_features import compute_gradient_features
 
 class Input(pydantic.BaseModel):
     """Prediction input that will be received from the client.
@@ -31,7 +31,7 @@ class Input(pydantic.BaseModel):
     use_patches: Optional[bool] = False  # Whether to use patch-based inference
     patch_overlap: Optional[List[int]] = None  # [z, y, x] dimensions for patch overlap
     apply_augmentations: Optional[bool] = False  # Whether to apply gradient direction augmentations
-
+    use_gradient_features: Optional[bool] = False 
 
 class Output(pydantic.BaseModel):
     """Prediction output that will be returned to the client.
@@ -412,7 +412,24 @@ class Model(mlflow.pyfunc.PythonModel):
             # Convert to tensor and add batch and channel dimensions
             input_tensor = torch.from_numpy(normalized_volume).float().unsqueeze(0).unsqueeze(0)
             
-            # Apply gradient direction augmentations if requested
+            # First, compute gradient features if requested
+            use_gradient_features = input_data.get('use_gradient_features', False)
+            if use_gradient_features:
+                # Compute gradient features on the normalized volume
+                volume_features = compute_gradient_features(normalized_volume)
+                feature_tensor = torch.from_numpy(volume_features).float().unsqueeze(0)  # Add batch dim
+                
+                # Convert original volume to tensor
+                input_tensor = torch.from_numpy(normalized_volume).float().unsqueeze(0).unsqueeze(0)
+                
+                # Concatenate with original input
+                input_tensor = torch.cat([input_tensor, feature_tensor], dim=1)
+                logging.info(f"Added gradient features, input shape: {input_tensor.shape}")
+            else:
+                # Standard path without gradient features
+                input_tensor = torch.from_numpy(normalized_volume).float().unsqueeze(0).unsqueeze(0)
+
+            # Then, apply gradient direction augmentations if requested
             apply_augs = input_data.get('apply_augmentations', False)
             if apply_augs:
                 input_tensor = apply_gradient_augmentations(
@@ -422,10 +439,9 @@ class Model(mlflow.pyfunc.PythonModel):
                     seed=42
                 )
                 logging.info("Applied gradient direction augmentations")
-            
-            # Move to the appropriate device
+
+            # Finally, move to device and return
             input_tensor = input_tensor.to(self.device)
-            
             return input_tensor, original_input
             
         except Exception as e:

@@ -13,6 +13,12 @@ from common import (
     configure_logging,
     load_image,
 )
+from gradient_analysis import (
+    analyze_gradient_direction, 
+    normalize_gradient_direction, 
+    visualize_gradient_analysis
+)
+from gradient_features import GradientFeatureProcessor
 from metaflow import (
     FlowSpec,
     Parameter,
@@ -101,6 +107,18 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
         default=False,
     )
 
+    normalize_gradients = Parameter(
+        "normalize-gradients",
+        help="Whether to normalize gradient directions during training",
+        default=True,
+    )
+
+    use_gradient_features = Parameter(
+        "use-gradient-features",
+        help="Whether to include gradient direction features as additional input channels",
+        default=False,
+    )
+
     @card
     @step
     def start(self):
@@ -154,11 +172,22 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
         """Create the 3D U-Net model for image fusion."""
         import torch
         # Get input shape from patch size
+        # Create gradient feature processor
+        self.feature_processor = GradientFeatureProcessor(
+            use_gradient_features=self.use_gradient_features
+        )
+        
+        # Get input shape from patch size
         patch_size = self.get_patch_size()
-        input_shape = (1, *patch_size)  # (C, Z, Y, X)
+        
+        # Determine number of input channels based on whether we're using gradient features
+        in_channels = 7 if self.use_gradient_features else 1  # 1 original + 6 gradient features
         
         # Build model
-        self.model = build_unet3d_model(input_shape, use_physics=self.use_physics)
+        self.model = build_unet3d_model(
+            input_shape=(in_channels, *patch_size),  # Update input shape
+            use_physics=self.use_physics
+        )
         
         # Configure training with proper device detection
         # First check for Apple Silicon MPS (Metal Performance Shaders)
@@ -214,12 +243,26 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
                         # Handle different batch formats (dict or list)
                         if isinstance(batch, dict) and 'input' in batch and 'target' in batch:
                             # Dictionary format from your dataset
-                            inputs = batch['input'].to(self.device)
+                            # Add gradient features if enabled
+                            if self.use_gradient_features:
+                                batch = self.feature_processor.process_batch(batch)
+                                inputs = batch['input_with_features'].to(self.device)
+                            else:
+                                inputs = batch['input'].to(self.device)
+                            
                             targets = batch['target'].to(self.device)
+                            
                         elif isinstance(batch, (list, tuple)) and len(batch) >= 2:
                             # List format (likely from TensorDataset in test mode)
                             inputs = batch[0].to(self.device)
                             targets = batch[1].to(self.device)
+                            
+                            # Handle gradient features for list format if needed
+                            if self.use_gradient_features:
+                                # Convert to appropriate format for processor
+                                temp_batch = {'input': inputs}
+                                processed_batch = self.feature_processor.process_batch(temp_batch)
+                                inputs = processed_batch['input_with_features']
                         else:
                             # Unknown format - log and skip
                             logging.warning(f"Unknown batch format: {type(batch)}")
@@ -647,6 +690,18 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
             "percentile_max": 98
         }
         
+        # Save model configuration
+        model_config = {
+            'in_channels': 7 if self.use_gradient_features else 1,
+            'use_gradient_features': self.use_gradient_features,
+            'use_physics': self.use_physics,
+            'patch_size': self.get_patch_size()
+        }
+        
+        config_path = (artifacts_dir / "model_config.json").as_posix()
+        with open(config_path, 'w') as f:
+            json.dump(model_config, f)
+            
         # Save the patch config as JSON
         patch_config_path = (artifacts_dir / "patch_config.json").as_posix()
         with open(patch_config_path, 'w') as f:
