@@ -13,6 +13,7 @@ This project addresses the challenge posed by France-BioImaging's "Fuse My Cells
 - MLflow integration for experiment tracking and model management
 - Metaflow for workflow orchestration
 - Implementation of the challenge evaluation metrics (N_SSIM)
+- Memory-efficient patch-based training for local development on laptops/MacBooks
 
 ## Repository Structure
 
@@ -21,12 +22,22 @@ fusemycell/
 ├── data/
 │   ├── raw/                  # Original multiview datasets
 │   └── processed/            # Preprocessed and aligned data
+├── patches/                  # Extracted patches for memory-efficient training
 ├── models/
 │   └── checkpoints/          # Saved model weights
 ├── mlruns/                   # MLflow run data
 ├── artifacts/                # MLflow artifacts
 ├── common.py                 # Common utilities for the project
-├── training.py               # Metaflow training pipeline
+├── pipelines/
+│   ├── training.py           # Metaflow training pipeline
+│   ├── inference/            # Inference code and deployment
+│   ├── local/                # Local development utilities
+│   │   ├── analyze_tiff.py   # TIFF analysis script
+│   │   ├── extract_patches.py # Patch extraction for memory efficiency 
+│   │   └── mac_train.py      # MacBook-optimized training script
+│   └── utils/                # Shared utilities
+│       ├── memory_monitor.py # Memory monitoring utility
+│       └── patch_dataset.py  # Patch-based dataset implementation
 ├── start_mlflow.sh           # Script to start MLflow server
 └── README.md                 # Project documentation
 ```
@@ -36,7 +47,7 @@ fusemycell/
 ### Prerequisites
 
 - Python 3.12.8
-- CUDA-compatible GPU (recommended)
+- CUDA-compatible GPU (recommended) or Apple Silicon Mac with MPS
 
 ### Setup
 
@@ -54,7 +65,7 @@ fusemycell/
 
 3. Install dependencies:
    ```bash
-   pip install metaflow mlflow torch tifffile scikit-image cellpose matplotlib pandas numpy
+   pip install metaflow mlflow torch tifffile scikit-image cellpose matplotlib pandas numpy scikit-learn scipy
    ```
 
 ## Usage
@@ -76,26 +87,61 @@ Download the light sheet microscopy datasets using the provided URLs:
 
 ```bash
 # Create data directories
-mkdir -p data/raw
+mkdir -p data
 
 # Download data (replace with your data download script)
-python download_biostudies.py --output-dir data/raw
+python download_biostudies.py --output-dir data
 ```
 
-### Running the Training Pipeline
+### Training Workflows
+
+#### Cloud Training (Full Dataset)
+
+For full training on cloud infrastructure with high-performance GPUs:
 
 ```bash
 # Basic training
-python -m training run
+python -m pipelines.training run
 
 # With custom parameters
-python -m training run \
-  --dataset-dir data/raw \
+python -m pipelines.training run \
+  --dataset-dir data \
   --training-epochs 100 \
   --learning-rate 0.0005 \
   --patch-size 64,128,128 \
   --use-physics True
 ```
+
+#### Local Development (MacBook/Laptop)
+
+For local development and testing on resource-constrained machines:
+
+1. **Analyze your TIFF files** to understand their characteristics:
+   ```bash
+   python -m pipelines.local.analyze_tiff data/image_0_nucleus_angle.tif
+   ```
+
+2. **Extract focused patches** from large TIFFs for memory-efficient training:
+   ```bash
+   python -m pipelines.local.extract_patches \
+     --data-dir data \
+     --output-dir patches \
+     --patch-size 32,64,64 \
+     --z-range 50,175 \
+     --focus-on-signal \
+     --normalize
+   ```
+
+3. **Train on the extracted patches** using an MPS-optimized script:
+   ```bash
+   python -m pipelines.local.mac_train \
+     --data-dir patches \
+     --output-dir models \
+     --batch-size 2 \
+     --accumulation-steps 4 \
+     --use-amp \
+     --monitor-interval 30
+   ```
 
 ### Viewing Results
 
@@ -124,6 +170,16 @@ The core model is a 3D U-Net with the following specifications:
 - Output: Fused 3D volume (1 channel)
 - Architecture: Encoder-decoder with skip connections
 - Optional physics-informed constraints
+
+## Memory Efficiency Features
+
+For large 3D microscopy images, we've implemented several memory optimization techniques:
+
+- **Patch-based processing**: Extract smaller 3D patches from large volumes
+- **Signal-focused extraction**: Concentrate patches on regions with meaningful content
+- **Gradient accumulation**: Simulate larger batch sizes with less memory
+- **MPS acceleration**: Use Apple Silicon GPU acceleration on MacBooks
+- **Memory monitoring**: Track memory usage during training to avoid OOM errors
 
 ## Future Work
 
