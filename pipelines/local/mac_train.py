@@ -17,7 +17,7 @@ import psutil
 import threading
 
 # Import from your original code
-from pipelines.common import (
+from ..common import (
     build_unet3d_model,
     compute_n_ssim,
     apply_gradient_augmentations

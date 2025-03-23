@@ -21,12 +21,17 @@ PACKAGES = {
     "scikit-learn": "1.6.1",
     "mlflow": "2.20.2",
     "tensorflow": "2.17.0",
-    "torch": "2.3.1",
+    "torch": "2.6.0",
+    # "conda-forge::tensorflow-metal": "",
     "torchvision": "0.18.1",
-    "torchaudio": "2.3.1",
+    "torchaudio": "2.6.0",
     "tifffile": "2024.2.12",
     "scikit-image": "0.22.0",
-    "cellpose": "2.2.4",
+    "cellpose": "",
+    "numpy": "",
+    "pandas": "",
+    "matplotlib": "",
+    "tqdm": "",
 }
 
 def apply_gradient_augmentations(angle_tensor, fused_tensor=None, apply_augs=True, seed=None):
@@ -216,45 +221,44 @@ class FuseMyCellDataset(Dataset):
                 - 'target': Fused-view image tensor
                 - 'file_path': Path to the input file
         """
-        def __getitem__(self, idx):
-            angle_file, fused_file = self.file_pairs[idx]
-            
-            # Load the TIFF files
-            try:
-                angle_img = tifffile.imread(angle_file)
-                fused_img = tifffile.imread(fused_file)
-            except Exception as e:
-                logging.error(f"Error loading files {angle_file} and {fused_file}: {e}")
-                # Return a placeholder if loading fails
-                return self.__getitem__((idx + 1) % len(self))
-            
-            # Ensure 3D format (handle 2D images)
-            if len(angle_img.shape) == 2:
-                angle_img = angle_img[np.newaxis, ...]
-            if len(fused_img.shape) == 2:
-                fused_img = fused_img[np.newaxis, ...]
-                
-            # Handle 4D images (with channels)
-            if len(angle_img.shape) == 4:
-                angle_img = angle_img[..., 0]
-            if len(fused_img.shape) == 4:
-                fused_img = fused_img[..., 0]
-            
-            # Apply gradient direction normalization if requested
-            if self.normalize_gradients:
-                angle_img, gradient_info = normalize_gradient_direction(angle_img)
-                # Use the same direction for the fused image
-                target_directions = {
-                    'z_direction': gradient_info['z_direction'],
-                    'y_direction': gradient_info['y_direction'],
-                    'x_direction': gradient_info['x_direction']
-                }
-                fused_img, _ = normalize_gradient_direction(fused_img, target_directions)
-                
-                # Log gradient info occasionally
-                if idx % 100 == 0:
-                    logging.info(f"Gradient info for sample {idx}: {gradient_info}")
+        angle_file, fused_file = self.file_pairs[idx]
         
+        # Load the TIFF files
+        try:
+            angle_img = tifffile.imread(angle_file)
+            fused_img = tifffile.imread(fused_file)
+        except Exception as e:
+            logging.error(f"Error loading files {angle_file} and {fused_file}: {e}")
+            # Return a placeholder if loading fails
+            return self.__getitem__((idx + 1) % len(self))
+        
+        # Ensure 3D format (handle 2D images)
+        if len(angle_img.shape) == 2:
+            angle_img = angle_img[np.newaxis, ...]
+        if len(fused_img.shape) == 2:
+            fused_img = fused_img[np.newaxis, ...]
+            
+        # Handle 4D images (with channels)
+        if len(angle_img.shape) == 4:
+            angle_img = angle_img[..., 0]
+        if len(fused_img.shape) == 4:
+            fused_img = fused_img[..., 0]
+        
+        # Apply gradient direction normalization if requested
+        if self.normalize_gradients:
+            angle_img, gradient_info = normalize_gradient_direction(angle_img)
+            # Use the same direction for the fused image
+            target_directions = {
+                'z_direction': gradient_info['z_direction'],
+                'y_direction': gradient_info['y_direction'],
+                'x_direction': gradient_info['x_direction']
+            }
+            fused_img, _ = normalize_gradient_direction(fused_img, target_directions)
+            
+            # Log gradient info occasionally
+            if idx % 100 == 0:
+                logging.info(f"Gradient info for sample {idx}: {gradient_info}")
+    
         # Apply normalization
         angle_img = self._normalize(angle_img)
         fused_img = self._normalize(fused_img)
@@ -359,7 +363,7 @@ class FuseMyCellDataset(Dataset):
 
 
 def prepare_data_loaders(dataset_dir, study_ids=None, batch_size=4, patch_size=(64, 128, 128), 
-                        num_workers=4, train_ratio=0.8, max_samples=None):
+                        num_workers=4, train_ratio=0.8, max_samples=None, normalize_gradients=False):
     """
     Prepare data loaders for training and validation.
     
@@ -383,7 +387,7 @@ def prepare_data_loaders(dataset_dir, study_ids=None, batch_size=4, patch_size=(
         random_crop=True,
         max_samples=max_samples,
         apply_augmentations=True,
-        normalize_gradients=False
+        normalize_gradients=normalize_gradients
     )
     
     # Split into training and validation sets
@@ -462,6 +466,7 @@ class DatasetMixin:
         help="S3 bucket containing the dataset files (used in production mode).",
         default="",
     )
+
 
     def get_patch_size(self):
         """Convert patch size parameter to tuple."""
@@ -735,7 +740,7 @@ def load_image(image_path):
         return None
 
 
-def build_unet3d_model(input_shape, use_physics=False):
+def build_unet3d_model(input_shape, use_physics=False, use_tensorflow=True, learning_rate=0.001):
     """
     Build a 3D U-Net model for single-view to multiview fusion.
     
@@ -748,23 +753,41 @@ def build_unet3d_model(input_shape, use_physics=False):
     """
     import logging
     
-    # Determine whether input_shape includes channel dimension
-    if len(input_shape) == 3:  # If input_shape is (z, y, x)
-        in_channels = 1
-    elif len(input_shape) == 4:  # If input_shape is (c, z, y, x)
-        in_channels = input_shape[0]
+    if use_tensorflow:
+        import tensorflow as tf
+        from tensorflow_unet3d import build_tf_unet3d
+        
+        # TensorFlow uses channels last format, so we need to adjust the input shape
+        if len(input_shape) == 4:  # (C, D, H, W)
+            # Convert from PyTorch format (C,D,H,W) to TensorFlow format (D,H,W,C)
+            tf_input_shape = (input_shape[1], input_shape[2], input_shape[3], input_shape[0])
+            print(f"Converting PyTorch shape {input_shape} to TensorFlow shape {tf_input_shape}")
+        elif len(input_shape) == 3:  # (D, H, W)
+            # Add channel dimension for single-channel data
+            tf_input_shape = (*input_shape, 1)
+            print(f"Adding channel to shape {input_shape} → {tf_input_shape}")
+        else:
+            raise ValueError(f"Unexpected input shape: {input_shape}")
+        
+        # Build the model
+        model = build_tf_unet3d(tf_input_shape, use_physics=use_physics)
+        
+        # Compile the model
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+            loss='mse',
+            metrics=['mae']
+        )
+        
+        return model
     else:
-        raise ValueError(f"Unexpected input shape: {input_shape}. Should be (z, y, x) or (c, z, y, x)")
-    
-    # Create appropriate model based on use_physics flag
-    if use_physics:
-        logging.info("Creating physics-informed UNet3D model")
-        model = PhysicsInformedUNet3D(in_channels=in_channels, out_channels=1, init_features=64)
-    else:
-        logging.info("Creating standard UNet3D model")
-        model = UNet3D(in_channels=in_channels, out_channels=1, init_features=64)
-    
-    return model
+        # Original PyTorch implementation
+        from unet3d import UNet3D, PhysicsInformedUNet3D
+        
+        if use_physics:
+            return PhysicsInformedUNet3D(in_channels=input_shape[0], out_channels=1)
+        else:
+            return UNet3D(in_channels=input_shape[0], out_channels=1)
 
 
 def compute_3d_ssim(img1, img2):
