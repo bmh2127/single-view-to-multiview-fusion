@@ -589,6 +589,8 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
         
         mlflow.set_tracking_uri(self.mlflow_tracking_uri)
         
+        # First, evaluate baselines
+        baseline_metrics = self.evaluate_baseline_models()
         # Initialize metrics
         n_ssim_values = []
         file_paths = []
@@ -669,20 +671,44 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
             # Calculate and log overall metrics
             avg_n_ssim = np.mean(n_ssim_values)
             self.average_n_ssim = avg_n_ssim
+            
+            # Calculate improvements over baselines
+            improvements = {}
+            for baseline_name, baseline_value in baseline_metrics.items():
+                if baseline_name.startswith('avg_'):
+                    metric_name = baseline_name.replace('avg_', '')
+                    improvement = avg_n_ssim - baseline_value
+                    improvements[f'improvement_over_{metric_name}'] = improvement
+                    mlflow.log_metric(f'improvement_over_{metric_name}', improvement)
+                    logging.info(f"Improvement over {metric_name}: {improvement:.4f}")
+
             mlflow.log_metrics({
                 "average_n_ssim": avg_n_ssim,
                 "n_ssim_std": np.std(n_ssim_values)
             })
             
             logging.info("Average N-SSIM: %.4f", avg_n_ssim)
+        
+            # Plot distribution of N-SSIM values compared to baselines
+            plt.figure(figsize=(12, 8))
             
-            # Plot distribution of N-SSIM values
-            plt.figure(figsize=(10, 6))
-            plt.hist(n_ssim_values, bins=20, alpha=0.7)
-            plt.axvline(avg_n_ssim, color='r', linestyle='dashed', linewidth=2, label=f'Mean: {avg_n_ssim:.4f}')
+            # Plot model N-SSIM distribution
+            plt.hist(n_ssim_values, bins=20, alpha=0.7, label='Model')
+            
+            # Plot vertical lines for baselines
+            for baseline_name, baseline_value in baseline_metrics.items():
+                if baseline_name.startswith('avg_'):
+                    plt.axvline(baseline_value, color='r' if 'input_as_output' in baseline_name else 'g', 
+                            linestyle='dashed', linewidth=2, 
+                            label=f'Baseline: {baseline_name.replace("avg_", "").replace("_n_ssim", "")}')
+            
+            # Plot model average
+            plt.axvline(avg_n_ssim, color='b', linestyle='dashed', linewidth=2, 
+                    label=f'Model average: {avg_n_ssim:.4f}')
+            
             plt.xlabel('Normalized SSIM')
             plt.ylabel('Count')
-            plt.title('Distribution of N-SSIM Values')
+            plt.title('Distribution of N-SSIM Values vs. Baselines')
             plt.legend()
             
             # Save plot to temp file and log as artifact
@@ -700,12 +726,113 @@ class FuseMyCellTraining(FlowSpec, DatasetMixin):
         # Proceed to model registration
         self.next(self.register_model)
     
+    def evaluate_baseline_models(self):
+        """Evaluate baseline models for comparison with our trained model."""
+        import mlflow
+        from tqdm import tqdm
+        import numpy as np
+        from scipy import ndimage
+        
+        mlflow.set_tracking_uri(self.mlflow_tracking_uri)
+        
+        # Initialize metrics for baselines
+        baseline_metrics = {
+            'input_as_output': [],  # Zero-rule baseline
+            'gaussian_blur': [],    # Simple enhancement baseline
+            'average_views': [],    # Average views baseline
+        }
+        
+        logging.info("Evaluating baseline models...")
+        
+        with mlflow.start_run(run_id=self.mlflow_run_id):
+            # Run baselines on validation data
+            for batch in tqdm(self.val_loader, desc="Baseline Evaluation"):
+                if isinstance(batch, dict) and 'input' in batch and 'target' in batch:
+                    inputs = batch['input']
+                    targets = batch['target']
+                    
+                    # Process each sample in the batch
+                    for i in range(len(inputs)):
+                        if self.is_tensorflow:
+                            # For TensorFlow, convert from PyTorch format
+                            input_np = inputs[i].numpy().transpose(1, 2, 3, 0)  # (C,D,H,W) -> (D,H,W,C)
+                            target_np = targets[i].numpy().transpose(1, 2, 3, 0)
+                            
+                            # Handle channel dimension if present
+                            if input_np.shape[-1] == 1:
+                                input_np = input_np[..., 0]
+                            if target_np.shape[-1] == 1:
+                                target_np = target_np[..., 0]
+                        else:
+                            # For PyTorch
+                            input_np = inputs[i, 0].cpu().numpy()  # Remove channel dimension
+                            target_np = targets[i, 0].cpu().numpy()
+                        
+                        # Baseline 1: Input-as-Output (should always give N_SSIM = 0)
+                        n_ssim_input = compute_n_ssim(input_np, target_np, input_np)
+                        baseline_metrics['input_as_output'].append(n_ssim_input)
+                        
+                        # Baseline 2: Simple gaussian blur enhancement
+                        enhanced_np = self._enhance_image_baseline(input_np)
+                        n_ssim_enhanced = compute_n_ssim(enhanced_np, target_np, input_np)
+                        baseline_metrics['gaussian_blur'].append(n_ssim_enhanced)
+                        
+                        # Baseline 3: Average views simulation
+                        averaged_np = self._average_views_baseline(input_np)
+                        n_ssim_averaged = compute_n_ssim(averaged_np, target_np, input_np)
+                        baseline_metrics['average_views'].append(n_ssim_averaged)
+            
+            # Calculate average metrics for baselines
+            avg_metrics = {}
+            for baseline_name, values in baseline_metrics.items():
+                avg_value = np.mean(values)
+                avg_metrics[f'avg_{baseline_name}_n_ssim'] = avg_value
+                
+                # Log to MLflow
+                mlflow.log_metric(f'baseline_{baseline_name}_n_ssim', avg_value)
+                logging.info(f"Baseline {baseline_name} N-SSIM: {avg_value:.4f}")
+            
+            # Return metrics for comparison
+            return avg_metrics
+
+    def _enhance_image_baseline(self, image):
+        """Simple image enhancement as baseline."""
+        from scipy import ndimage
+        
+        # Apply simple gaussian blur for denoising
+        enhanced = ndimage.gaussian_filter(image, sigma=1)
+        
+        # Simple contrast enhancement
+        p2, p98 = np.percentile(enhanced, (2, 98))
+        if p98 > p2:
+            enhanced = (enhanced - p2) / (p98 - p2)
+            enhanced = np.clip(enhanced, 0, 1)
+        
+        return enhanced
+    
+    def _average_views_baseline(self, input_image):
+        """
+        Simulate a fusion effect by duplicating and averaging the input image 
+        with a slightly shifted version to mimic having another view.
+        """
+        from scipy import ndimage
+        
+        # Create a simulated second view by shifting slightly
+        shift_amount = 2  # pixels
+        shifted_view = ndimage.shift(input_image, (0, shift_amount, shift_amount), mode='nearest')
+        
+        # Simple average of the two views
+        fused_view = (input_image + shifted_view) / 2.0
+        
+        return fused_view
+    
     def _evaluate_patch_inference(self):
         """Evaluate patch-based inference on select validation samples."""
         import mlflow
         import matplotlib.pyplot as plt
         import numpy as np
-        
+        import os
+        import torch
         logging.info("Evaluating patch-based inference...")
         
         # Select a few samples from validation set
